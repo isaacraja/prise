@@ -2,13 +2,14 @@
 
 ## Zig Development
 
-Always use `zigdoc` to discover Zig standard library APIs - assume training data is out of date.
+Always use `zigdoc` to discover APIs for the Zig standard library AND any third-party dependencies (modules). Assume training data is out of date.
 
 Examples:
 ```bash
 zigdoc std.fs
 zigdoc std.posix.getuid
-zigdoc std.fmt.allocPrint
+zigdoc ghostty-vt.Terminal
+zigdoc vaxis.Window
 ```
 
 ## Build Commands
