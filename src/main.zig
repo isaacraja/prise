@@ -168,5 +168,7 @@ test {
 
     if (builtin.os.tag.isDarwin() or builtin.os.tag.isBSD()) {
         _ = @import("io/kqueue.zig");
+    } else if (builtin.os.tag.isLinux()) {
+        _ = @import("io/io_uring.zig");
     }
 }

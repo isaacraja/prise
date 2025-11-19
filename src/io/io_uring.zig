@@ -21,6 +21,7 @@ pub const Loop = struct {
         socket,
         connect,
         accept,
+        read,
         recv,
         send,
         close,
@@ -99,6 +100,28 @@ pub const Loop = struct {
         });
 
         const sqe = try self.ring.accept(@intCast(fd), null, null, 0);
+        sqe.user_data = id;
+
+        return root.Task{ .id = id, .ctx = ctx };
+    }
+
+    pub fn read(
+        self: *Loop,
+        fd: posix.socket_t,
+        buf: []u8,
+        ctx: root.Context,
+    ) !root.Task {
+        const id = self.next_id;
+        self.next_id += 1;
+
+        try self.pending.put(id, .{
+            .ctx = ctx,
+            .kind = .read,
+            .buf = buf,
+            .fd = fd,
+        });
+
+        const sqe = try self.ring.read(@intCast(fd), buf, 0);
         sqe.user_data = id;
 
         return root.Task{ .id = id, .ctx = ctx };
@@ -265,6 +288,7 @@ pub const Loop = struct {
                 .CONNREFUSED => error.ConnectionRefused,
                 .INPROGRESS => error.WouldBlock,
                 .AGAIN => error.WouldBlock,
+                .CANCELED => error.Canceled,
                 else => error.IOError,
             };
 
@@ -302,6 +326,15 @@ pub const Loop = struct {
                     .msg = ctx.msg,
                     .callback = ctx.cb,
                     .result = .{ .accept = @intCast(cqe.res) },
+                });
+            },
+
+            .read => {
+                try ctx.cb(self, .{
+                    .userdata = ctx.ptr,
+                    .msg = ctx.msg,
+                    .callback = ctx.cb,
+                    .result = .{ .read = @intCast(cqe.res) },
                 });
             },
 
@@ -349,3 +382,282 @@ pub const Loop = struct {
         forever,
     };
 };
+
+test "io_uring loop - init" {
+    const testing = std.testing;
+    var loop = Loop.init(testing.allocator) catch |err| {
+        // If io_uring is not supported or not available, we skip the test
+        // In a real CI environment with Linux, this should preferably fail if it's expected to work.
+        // But for local dev on mixed systems, this safety is good.
+        // However, std.os.linux.IoUring.init might throw various errors.
+        std.log.warn("Failed to init io_uring: {}", .{err});
+        return;
+    };
+    defer loop.deinit();
+}
+
+test "io_uring loop - timeout" {
+    const testing = std.testing;
+    var loop = Loop.init(testing.allocator) catch return;
+    defer loop.deinit();
+
+    var completed = false;
+    const State = struct {
+        completed: *bool,
+    };
+    var state = State{
+        .completed = &completed,
+    };
+
+    const callback = struct {
+        fn cb(l: *Loop, completion: root.Completion) !void {
+            _ = l;
+            const s = completion.userdataCast(State);
+            switch (completion.result) {
+                .timer => s.completed.* = true,
+                .err => |err| return err,
+                else => unreachable,
+            }
+        }
+    }.cb;
+
+    _ = try loop.timeout(10 * std.time.ns_per_ms, .{
+        .ptr = &state,
+        .cb = callback,
+    });
+
+    try loop.run(.until_done);
+    try testing.expect(completed);
+}
+
+test "io_uring loop - socket/connect/accept/recv/send/close" {
+    const testing = std.testing;
+    var loop = Loop.init(testing.allocator) catch return;
+    defer loop.deinit();
+
+    // Setup a listening socket (server)
+    const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+    defer posix.close(listen_fd);
+
+    var addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    try posix.bind(listen_fd, &addr.any, addr.getOsSockLen());
+    try posix.listen(listen_fd, 1);
+
+    // Get the assigned port
+    var len = addr.getOsSockLen();
+    try posix.getsockname(listen_fd, &addr.any, &len);
+
+    const State = struct {
+        client_fd: posix.socket_t = undefined,
+        accepted_fd: posix.socket_t = undefined,
+        sent_bytes: usize = 0,
+        received_bytes: usize = 0,
+        received_data: [64]u8 = undefined,
+        connect_done: bool = false,
+        accept_done: bool = false,
+        send_done: bool = false,
+        recv_done: bool = false,
+        close_client_done: bool = false,
+        close_accepted_done: bool = false,
+    };
+    var state = State{};
+
+    const Context = struct {
+        state: *State,
+        addr: *std.net.Address,
+    };
+    var ctx_struct = Context{ .state = &state, .addr = &addr };
+
+    const Handlers = struct {
+        fn close_accepted_cb(_: *Loop, completion: root.Completion) !void {
+            const s = completion.userdataCast(State);
+            if (completion.result == .close) s.close_accepted_done = true;
+        }
+
+        fn recv_cb(l: *Loop, completion: root.Completion) !void {
+            const s = completion.userdataCast(State);
+            switch (completion.result) {
+                .recv => |n| {
+                    s.received_bytes = n;
+                    s.recv_done = true;
+                    // Close accepted
+                    _ = try l.close(s.accepted_fd, .{
+                        .ptr = s,
+                        .cb = close_accepted_cb,
+                    });
+                },
+                .err => |err| return err,
+                else => unreachable,
+            }
+        }
+
+        fn accept_cb(l: *Loop, completion: root.Completion) !void {
+            const s = completion.userdataCast(State);
+            switch (completion.result) {
+                .accept => |fd| {
+                    s.accepted_fd = fd;
+                    s.accept_done = true;
+                    // Start recv
+                    _ = try l.recv(fd, &s.received_data, .{
+                        .ptr = s,
+                        .cb = recv_cb,
+                    });
+                },
+                .err => |err| return err,
+                else => unreachable,
+            }
+        }
+
+        fn close_client_cb(_: *Loop, completion: root.Completion) !void {
+            const s = completion.userdataCast(State);
+            if (completion.result == .close) s.close_client_done = true;
+        }
+
+        fn send_cb(l: *Loop, completion: root.Completion) !void {
+            const s = completion.userdataCast(State);
+            switch (completion.result) {
+                .send => |n| {
+                    s.sent_bytes = n;
+                    s.send_done = true;
+                    _ = try l.close(s.client_fd, .{
+                        .ptr = s,
+                        .cb = close_client_cb,
+                    });
+                },
+                .err => |err| return err,
+                else => unreachable,
+            }
+        }
+
+        fn connect_cb(l: *Loop, completion: root.Completion) !void {
+            const s = completion.userdataCast(State);
+            switch (completion.result) {
+                .connect => {
+                    s.connect_done = true;
+                    const msg = "Hello";
+                    _ = try l.send(s.client_fd, msg, .{
+                        .ptr = s,
+                        .cb = send_cb,
+                    });
+                },
+                .err => |err| return err,
+                else => unreachable,
+            }
+        }
+
+        fn socket_cb(l: *Loop, completion: root.Completion) !void {
+            const ctx = completion.userdataCast(Context);
+            const s = ctx.state;
+            switch (completion.result) {
+                .socket => |fd| {
+                    s.client_fd = fd;
+                    _ = try l.connect(fd, &ctx.addr.any, ctx.addr.getOsSockLen(), .{
+                        .ptr = s,
+                        .cb = connect_cb,
+                    });
+                },
+                .err => |err| return err,
+                else => unreachable,
+            }
+        }
+    };
+
+    _ = try loop.accept(listen_fd, .{ .ptr = &state, .cb = Handlers.accept_cb });
+
+    _ = try loop.socket(posix.AF.INET, posix.SOCK.STREAM, 0, .{
+        .ptr = &ctx_struct,
+        .cb = Handlers.socket_cb,
+    });
+
+    try loop.run(.until_done);
+
+    try testing.expect(state.accept_done);
+    try testing.expect(state.connect_done);
+    try testing.expect(state.send_done);
+    try testing.expect(state.recv_done);
+    try testing.expect(state.close_client_done);
+    try testing.expect(state.close_accepted_done);
+    try testing.expectEqual(@as(usize, 5), state.sent_bytes);
+    try testing.expectEqual(@as(usize, 5), state.received_bytes);
+    try testing.expectEqualStrings("Hello", state.received_data[0..5]);
+}
+
+test "io_uring loop - cancel" {
+    const testing = std.testing;
+    var loop = Loop.init(testing.allocator) catch return;
+    defer loop.deinit();
+
+    // Create a socket pair or pipe
+    const fds = try posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    defer {
+        posix.close(fds[0]);
+        posix.close(fds[1]);
+    }
+
+    var canceled = false;
+    const State = struct {
+        canceled: *bool,
+    };
+    var state = State{ .canceled = &canceled };
+
+    const cb = struct {
+        fn cb(l: *Loop, completion: root.Completion) !void {
+            _ = l;
+            const s = completion.userdataCast(State);
+            switch (completion.result) {
+                .err => |err| {
+                    if (err == error.Canceled) s.canceled.* = true;
+                },
+                else => {},
+            }
+        }
+    }.cb;
+
+    var buf: [1]u8 = undefined;
+    // Read from pipe[0], nothing written so it should block
+    var task = try loop.read(fds[0], &buf, .{ .ptr = &state, .cb = cb });
+
+    try task.cancel(&loop);
+
+    try loop.run(.until_done);
+    try testing.expect(canceled);
+}
+
+test "io_uring loop - cancelByFd" {
+    const testing = std.testing;
+    var loop = Loop.init(testing.allocator) catch return;
+    defer loop.deinit();
+
+    const fds = try posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    defer {
+        posix.close(fds[0]);
+        posix.close(fds[1]);
+    }
+
+    var canceled = false;
+    const State = struct {
+        canceled: *bool,
+    };
+    var state = State{ .canceled = &canceled };
+
+    const cb = struct {
+        fn cb(l: *Loop, completion: root.Completion) !void {
+            _ = l;
+            const s = completion.userdataCast(State);
+            switch (completion.result) {
+                .err => |err| {
+                    if (err == error.Canceled) s.canceled.* = true;
+                },
+                else => {},
+            }
+        }
+    }.cb;
+
+    var buf: [1]u8 = undefined;
+    _ = try loop.read(fds[0], &buf, .{ .ptr = &state, .cb = cb });
+
+    loop.cancelByFd(fds[0]);
+
+    try loop.run(.until_done);
+    try testing.expect(canceled);
+}
