@@ -523,12 +523,10 @@ const Client = struct {
                 response_arr[3] = result; // result
 
                 const response_value = msgpack.Value{ .array = response_arr };
-                self.send_buffer = try msgpack.encodeFromValue(self.server.allocator, response_value);
+                const response_bytes = try msgpack.encodeFromValue(self.server.allocator, response_value);
+                defer self.server.allocator.free(response_bytes);
 
-                _ = try loop.send(self.fd, self.send_buffer.?, .{
-                    .ptr = self,
-                    .cb = onSendComplete,
-                });
+                try self.sendData(loop, response_bytes);
             },
             .notification => |notif| {
                 // Handle notifications (no response needed)

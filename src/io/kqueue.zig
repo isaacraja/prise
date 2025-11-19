@@ -311,9 +311,9 @@ pub const Loop = struct {
         var changes = [_]posix.Kevent{.{
             .ident = @intCast(op.fd),
             .filter = switch (op.kind) {
-                .read => c.EVFILT.READ,
-                .recv => c.EVFILT.READ,
-                .send => c.EVFILT.WRITE,
+                .read, .recv, .accept => c.EVFILT.READ,
+                .send, .connect => c.EVFILT.WRITE,
+                .timer => c.EVFILT.TIMER,
                 else => return,
             },
             .flags = c.EV.DELETE,
