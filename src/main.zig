@@ -156,6 +156,7 @@ pub fn main() !void {
 }
 
 test {
+    const builtin = @import("builtin");
     _ = @import("io/mock.zig");
     _ = @import("server.zig");
     _ = @import("msgpack.zig");
@@ -164,4 +165,8 @@ test {
     _ = @import("client.zig");
     _ = @import("redraw.zig");
     _ = @import("Surface.zig");
+
+    if (builtin.os.tag.isDarwin() or builtin.os.tag.isBSD()) {
+        _ = @import("io/kqueue.zig");
+    }
 }

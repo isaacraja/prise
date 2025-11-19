@@ -55,7 +55,7 @@ pub const Loop = struct {
 
         // Socket creation is synchronous, complete immediately
         const fd = posix.socket(domain, socket_type, protocol) catch |err| {
-            try ctx.cb(self, .{
+            try ctx.cb(@ptrCast(self), .{
                 .userdata = ctx.ptr,
                 .msg = ctx.msg,
                 .callback = ctx.cb,
@@ -64,7 +64,7 @@ pub const Loop = struct {
             return root.Task{ .id = id, .ctx = ctx };
         };
 
-        try ctx.cb(self, .{
+        try ctx.cb(@ptrCast(self), .{
             .userdata = ctx.ptr,
             .msg = ctx.msg,
             .callback = ctx.cb,
@@ -89,7 +89,7 @@ pub const Loop = struct {
 
         if (rc == 0) {
             // Connected immediately
-            try ctx.cb(self, .{
+            try ctx.cb(@ptrCast(self), .{
                 .userdata = ctx.ptr,
                 .msg = ctx.msg,
                 .callback = ctx.cb,
@@ -123,7 +123,7 @@ pub const Loop = struct {
                     .NETUNREACH => error.NetworkUnreachable,
                     else => posix.unexpectedErrno(err),
                 };
-                try ctx.cb(self, .{
+                try ctx.cb(@ptrCast(self), .{
                     .userdata = ctx.ptr,
                     .msg = ctx.msg,
                     .callback = ctx.cb,
@@ -259,7 +259,7 @@ pub const Loop = struct {
 
         posix.close(fd);
 
-        try ctx.cb(self, .{
+        try ctx.cb(@ptrCast(self), .{
             .userdata = ctx.ptr,
             .msg = ctx.msg,
             .callback = ctx.cb,
@@ -383,7 +383,7 @@ pub const Loop = struct {
         const ctx = op.ctx;
 
         if (ev.flags & c.EV.ERROR != 0) {
-            try ctx.cb(self, .{
+            try ctx.cb(@ptrCast(self), .{
                 .userdata = ctx.ptr,
                 .msg = ctx.msg,
                 .callback = ctx.cb,
@@ -399,7 +399,7 @@ pub const Loop = struct {
                 _ = posix.system.getsockopt(op.fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&err_code), &len);
 
                 if (err_code == 0) {
-                    try ctx.cb(self, .{
+                    try ctx.cb(@ptrCast(self), .{
                         .userdata = ctx.ptr,
                         .msg = ctx.msg,
                         .callback = ctx.cb,
@@ -407,7 +407,7 @@ pub const Loop = struct {
                     });
                 } else {
                     const err = posix.unexpectedErrno(@enumFromInt(err_code));
-                    try ctx.cb(self, .{
+                    try ctx.cb(@ptrCast(self), .{
                         .userdata = ctx.ptr,
                         .msg = ctx.msg,
                         .callback = ctx.cb,
@@ -418,7 +418,7 @@ pub const Loop = struct {
 
             .accept => {
                 const client_fd = posix.accept(op.fd, null, null, posix.SOCK.CLOEXEC) catch |err| {
-                    try ctx.cb(self, .{
+                    try ctx.cb(@ptrCast(self), .{
                         .userdata = ctx.ptr,
                         .msg = ctx.msg,
                         .callback = ctx.cb,
@@ -427,7 +427,7 @@ pub const Loop = struct {
                     return;
                 };
 
-                try ctx.cb(self, .{
+                try ctx.cb(@ptrCast(self), .{
                     .userdata = ctx.ptr,
                     .msg = ctx.msg,
                     .callback = ctx.cb,
@@ -437,7 +437,7 @@ pub const Loop = struct {
 
             .read => {
                 const bytes_read = posix.read(op.fd, op.buf) catch |err| {
-                    try ctx.cb(self, .{
+                    try ctx.cb(@ptrCast(self), .{
                         .userdata = ctx.ptr,
                         .msg = ctx.msg,
                         .callback = ctx.cb,
@@ -446,7 +446,7 @@ pub const Loop = struct {
                     return;
                 };
 
-                try ctx.cb(self, .{
+                try ctx.cb(@ptrCast(self), .{
                     .userdata = ctx.ptr,
                     .msg = ctx.msg,
                     .callback = ctx.cb,
@@ -456,7 +456,7 @@ pub const Loop = struct {
 
             .recv => {
                 const bytes_read = posix.recv(op.fd, op.buf, 0) catch |err| {
-                    try ctx.cb(self, .{
+                    try ctx.cb(@ptrCast(self), .{
                         .userdata = ctx.ptr,
                         .msg = ctx.msg,
                         .callback = ctx.cb,
@@ -465,7 +465,7 @@ pub const Loop = struct {
                     return;
                 };
 
-                try ctx.cb(self, .{
+                try ctx.cb(@ptrCast(self), .{
                     .userdata = ctx.ptr,
                     .msg = ctx.msg,
                     .callback = ctx.cb,
@@ -475,7 +475,7 @@ pub const Loop = struct {
 
             .send => {
                 const bytes_sent = posix.send(op.fd, op.buf, 0) catch |err| {
-                    try ctx.cb(self, .{
+                    try ctx.cb(@ptrCast(self), .{
                         .userdata = ctx.ptr,
                         .msg = ctx.msg,
                         .callback = ctx.cb,
@@ -484,7 +484,7 @@ pub const Loop = struct {
                     return;
                 };
 
-                try ctx.cb(self, .{
+                try ctx.cb(@ptrCast(self), .{
                     .userdata = ctx.ptr,
                     .msg = ctx.msg,
                     .callback = ctx.cb,
@@ -493,7 +493,7 @@ pub const Loop = struct {
             },
 
             .timer => {
-                try ctx.cb(self, .{
+                try ctx.cb(@ptrCast(self), .{
                     .userdata = ctx.ptr,
                     .msg = ctx.msg,
                     .callback = ctx.cb,
@@ -511,3 +511,377 @@ pub const Loop = struct {
         forever,
     };
 };
+
+test "kqueue: timer" {
+    const allocator = std.testing.allocator;
+    var loop = try Loop.init(allocator);
+    defer loop.deinit();
+
+    var fired = false;
+    const Cb = struct {
+        fn cb(_: *root.Loop, comp: root.Completion) !void {
+            const f = comp.userdataCast(bool);
+            f.* = true;
+        }
+    };
+
+    _ = try loop.timeout(10 * std.time.ns_per_ms, .{
+        .ptr = &fired,
+        .cb = Cb.cb,
+    });
+
+    try loop.run(.until_done);
+    try std.testing.expect(fired);
+}
+
+test "kqueue: socket creation" {
+    const allocator = std.testing.allocator;
+    var loop = try Loop.init(allocator);
+    defer loop.deinit();
+
+    var fired = false;
+    var socket_fd: posix.socket_t = undefined;
+
+    const Cb = struct {
+        fn cb(_: *root.Loop, comp: root.Completion) !void {
+            const ctx = comp.userdataCast(struct { fired: *bool, fd: *posix.socket_t });
+            ctx.fired.* = true;
+            switch (comp.result) {
+                .socket => |fd| ctx.fd.* = fd,
+                .err => |err| return err,
+                else => unreachable,
+            }
+        }
+    };
+
+    var ctx_data = struct { fired: *bool, fd: *posix.socket_t }{ .fired = &fired, .fd = &socket_fd };
+
+    _ = try loop.socket(posix.AF.INET, posix.SOCK.STREAM, 0, .{
+        .ptr = &ctx_data,
+        .cb = Cb.cb,
+    });
+
+    try loop.run(.until_done);
+    try std.testing.expect(fired);
+    posix.close(socket_fd);
+}
+
+test "kqueue: connect and accept" {
+    const allocator = std.testing.allocator;
+    var loop = try Loop.init(allocator);
+    defer loop.deinit();
+
+    // Setup listener
+    const listener = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer posix.close(listener);
+
+    var addr = posix.sockaddr.in{
+        .family = posix.AF.INET,
+        .port = 0, // ephemeral
+        .addr = 0, // loopback (0.0.0.0)
+    };
+    try posix.bind(listener, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    try posix.listen(listener, 1);
+
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    try posix.getsockname(listener, @ptrCast(&addr), &len);
+
+    // Client socket
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer posix.close(client_fd);
+
+    var connected = false;
+    var accepted = false;
+    var server_client_fd: posix.socket_t = undefined;
+
+    const Cb = struct {
+        fn onConnect(_: *root.Loop, comp: root.Completion) !void {
+            const flag = comp.userdataCast(bool);
+            switch (comp.result) {
+                .connect => flag.* = true,
+                .err => |err| return err,
+                else => unreachable,
+            }
+        }
+
+        fn onAccept(_: *root.Loop, comp: root.Completion) !void {
+            const ctx = comp.userdataCast(struct { flag: *bool, fd: *posix.socket_t });
+            switch (comp.result) {
+                .accept => |fd| {
+                    ctx.flag.* = true;
+                    ctx.fd.* = fd;
+                },
+                .err => |err| return err,
+                else => unreachable,
+            }
+        }
+    };
+
+    var accept_ctx = struct { flag: *bool, fd: *posix.socket_t }{ .flag = &accepted, .fd = &server_client_fd };
+    _ = try loop.accept(listener, .{
+        .ptr = &accept_ctx,
+        .cb = Cb.onAccept,
+    });
+
+    _ = try loop.connect(client_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in), .{
+        .ptr = &connected,
+        .cb = Cb.onConnect,
+    });
+
+    try loop.run(.until_done);
+
+    try std.testing.expect(connected);
+    try std.testing.expect(accepted);
+    posix.close(server_client_fd);
+}
+
+test "kqueue: send and recv" {
+    const allocator = std.testing.allocator;
+    var loop = try Loop.init(allocator);
+    defer loop.deinit();
+
+    var fds: [2]posix.socket_t = undefined;
+    {
+        const listener = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        defer posix.close(listener);
+        var addr = posix.sockaddr.in{ .family = posix.AF.INET, .port = 0, .addr = 0 };
+        try posix.bind(listener, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+        try posix.listen(listener, 1);
+        var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+        try posix.getsockname(listener, @ptrCast(&addr), &len);
+
+        fds[0] = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        try posix.connect(fds[0], @ptrCast(&addr), len);
+        fds[1] = try posix.accept(listener, null, null, 0);
+    }
+    defer {
+        posix.close(fds[0]);
+        posix.close(fds[1]);
+    }
+
+    const msg = "hello world";
+    var recv_buf: [128]u8 = undefined;
+    var sent = false;
+    var received = false;
+    var bytes_recv: usize = 0;
+
+    const Cb = struct {
+        fn onSend(_: *root.Loop, comp: root.Completion) !void {
+            const flag = comp.userdataCast(bool);
+            switch (comp.result) {
+                .send => |n| {
+                    if (n == msg.len) flag.* = true;
+                },
+                .err => |err| return err,
+                else => unreachable,
+            }
+        }
+        fn onRecv(_: *root.Loop, comp: root.Completion) !void {
+            const ctx = comp.userdataCast(struct { flag: *bool, bytes: *usize });
+            switch (comp.result) {
+                .recv => |n| {
+                    ctx.flag.* = true;
+                    ctx.bytes.* = n;
+                },
+                .err => |err| return err,
+                else => unreachable,
+            }
+        }
+    };
+
+    _ = try loop.send(fds[0], msg, .{ .ptr = &sent, .cb = Cb.onSend });
+    var recv_ctx = struct { flag: *bool, bytes: *usize }{ .flag = &received, .bytes = &bytes_recv };
+    _ = try loop.recv(fds[1], &recv_buf, .{ .ptr = &recv_ctx, .cb = Cb.onRecv });
+
+    try loop.run(.until_done);
+    try std.testing.expect(sent);
+    try std.testing.expect(received);
+    try std.testing.expectEqualStrings(msg, recv_buf[0..bytes_recv]);
+}
+
+test "kqueue: close" {
+    const allocator = std.testing.allocator;
+    var loop = try Loop.init(allocator);
+    defer loop.deinit();
+
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+
+    var closed = false;
+    const Cb = struct {
+        fn cb(_: *root.Loop, comp: root.Completion) !void {
+            const f = comp.userdataCast(bool);
+            switch (comp.result) {
+                .close => f.* = true,
+                .err => |err| return err,
+                else => unreachable,
+            }
+        }
+    };
+
+    _ = try loop.close(fd, .{ .ptr = &closed, .cb = Cb.cb });
+    try loop.run(.until_done);
+    try std.testing.expect(closed);
+}
+
+test "kqueue: read" {
+    const allocator = std.testing.allocator;
+    var loop = try Loop.init(allocator);
+    defer loop.deinit();
+
+    var fds: [2]posix.socket_t = undefined;
+    {
+        const listener = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        defer posix.close(listener);
+        var addr = posix.sockaddr.in{ .family = posix.AF.INET, .port = 0, .addr = 0 };
+        try posix.bind(listener, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+        try posix.listen(listener, 1);
+        var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+        try posix.getsockname(listener, @ptrCast(&addr), &len);
+
+        fds[0] = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        try posix.connect(fds[0], @ptrCast(&addr), len);
+        fds[1] = try posix.accept(listener, null, null, 0);
+    }
+    defer {
+        posix.close(fds[0]);
+        posix.close(fds[1]);
+    }
+
+    const msg = "read me";
+    var read_buf: [128]u8 = undefined;
+    var sent = false;
+    var received = false;
+    var bytes_read: usize = 0;
+
+    const Cb = struct {
+        fn onSend(_: *root.Loop, comp: root.Completion) !void {
+            const flag = comp.userdataCast(bool);
+            switch (comp.result) {
+                .send => |n| {
+                    if (n == msg.len) flag.* = true;
+                },
+                .err => |err| return err,
+                else => unreachable,
+            }
+        }
+        fn onRead(_: *root.Loop, comp: root.Completion) !void {
+            const ctx = comp.userdataCast(struct { flag: *bool, bytes: *usize });
+            switch (comp.result) {
+                .read => |n| {
+                    ctx.flag.* = true;
+                    ctx.bytes.* = n;
+                },
+                .err => |err| return err,
+                else => unreachable,
+            }
+        }
+    };
+
+    _ = try loop.send(fds[0], msg, .{ .ptr = &sent, .cb = Cb.onSend });
+    var read_ctx = struct { flag: *bool, bytes: *usize }{ .flag = &received, .bytes = &bytes_read };
+    _ = try loop.read(fds[1], &read_buf, .{ .ptr = &read_ctx, .cb = Cb.onRead });
+
+    try loop.run(.until_done);
+    try std.testing.expect(sent);
+    try std.testing.expect(received);
+    try std.testing.expectEqualStrings(msg, read_buf[0..bytes_read]);
+}
+
+test "kqueue: cancelByFd" {
+    const allocator = std.testing.allocator;
+    var loop = try Loop.init(allocator);
+    defer loop.deinit();
+
+    var fds: [2]posix.socket_t = undefined;
+    {
+        const listener = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        defer posix.close(listener);
+        var addr = posix.sockaddr.in{ .family = posix.AF.INET, .port = 0, .addr = 0 };
+        try posix.bind(listener, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+        try posix.listen(listener, 1);
+        var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+        try posix.getsockname(listener, @ptrCast(&addr), &len);
+
+        fds[0] = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        try posix.connect(fds[0], @ptrCast(&addr), len);
+        fds[1] = try posix.accept(listener, null, null, 0);
+    }
+    defer {
+        posix.close(fds[0]);
+        posix.close(fds[1]);
+    }
+
+    var fired = false;
+    const Cb = struct {
+        fn cb(_: *root.Loop, comp: root.Completion) !void {
+            const f = comp.userdataCast(bool);
+            f.* = true;
+        }
+    };
+
+    var buf: [1]u8 = undefined;
+    // Start a read
+    _ = try loop.read(fds[0], &buf, .{ .ptr = &fired, .cb = Cb.cb });
+
+    // Cancel all ops for this FD
+    loop.cancelByFd(fds[0]);
+
+    // Timer to ensure we don't hang
+    var timer_fired = false;
+    _ = try loop.timeout(10 * std.time.ns_per_ms, .{ .ptr = &timer_fired, .cb = Cb.cb });
+
+    try loop.run(.until_done);
+
+    try std.testing.expect(!fired);
+    try std.testing.expect(timer_fired);
+}
+
+test "kqueue: cancel" {
+    const allocator = std.testing.allocator;
+    var loop = try Loop.init(allocator);
+    defer loop.deinit();
+
+    var fds: [2]posix.socket_t = undefined;
+    {
+        const listener = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        defer posix.close(listener);
+        var addr = posix.sockaddr.in{ .family = posix.AF.INET, .port = 0, .addr = 0 };
+        try posix.bind(listener, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+        try posix.listen(listener, 1);
+        var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+        try posix.getsockname(listener, @ptrCast(&addr), &len);
+
+        fds[0] = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        try posix.connect(fds[0], @ptrCast(&addr), len);
+        fds[1] = try posix.accept(listener, null, null, 0);
+    }
+    defer {
+        posix.close(fds[0]);
+        posix.close(fds[1]);
+    }
+
+    var fired = false;
+    const Cb = struct {
+        fn cb(_: *root.Loop, comp: root.Completion) !void {
+            const f = comp.userdataCast(bool);
+            f.* = true;
+        }
+    };
+
+    var buf: [1]u8 = undefined;
+    // Start a read that won't complete because we don't write
+    const task = try loop.read(fds[0], &buf, .{ .ptr = &fired, .cb = Cb.cb });
+
+    // Cancel it
+    try loop.cancel(task.id);
+
+    // Run loop - should return immediately as no pending ops (if cancel worked)
+    // But to be sure it doesn't block, let's schedule a timer too.
+    var timer_fired = false;
+    _ = try loop.timeout(10 * std.time.ns_per_ms, .{ .ptr = &timer_fired, .cb = Cb.cb });
+
+    try loop.run(.until_done);
+
+    try std.testing.expect(!fired);
+    try std.testing.expect(timer_fired);
+}
