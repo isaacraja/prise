@@ -241,7 +241,7 @@ const ScreenState = struct {
     cursor_visible: bool,
     cursor_shape: redraw.UIEvent.CursorShape.Shape,
     rows_data: []DirtyRow,
-    styles: std.AutoHashMap(u16, redraw.UIEvent.Style.Attributes),
+    styles: std.AutoHashMap(u32, redraw.UIEvent.Style.Attributes),
     allocator: std.mem.Allocator,
 
     pub const RenderMode = enum { full, incremental };
@@ -253,7 +253,7 @@ const ScreenState = struct {
 
     const CellData = struct {
         text: []const u8, // UTF-8 encoded
-        style_id: u16,
+        style_id: u32,
         wide: bool, // true if this cell is wide (occupies 2 columns)
     };
 
@@ -267,8 +267,12 @@ const ScreenState = struct {
         const rows = page.size.rows;
         const cols = page.size.cols;
 
-        var styles = std.AutoHashMap(u16, redraw.UIEvent.Style.Attributes).init(allocator);
+        var styles = std.AutoHashMap(u32, redraw.UIEvent.Style.Attributes).init(allocator);
         errdefer styles.deinit();
+
+        var synthetic_cache = std.AutoHashMap(redraw.UIEvent.Style.Attributes, u32).init(allocator);
+        defer synthetic_cache.deinit();
+        var next_synthetic_id: u32 = 65536;
 
         var rows_data = std.ArrayList(DirtyRow).empty;
         errdefer {
@@ -293,6 +297,9 @@ const ScreenState = struct {
                 width: usize,
                 u_buf: *[4]u8,
                 g_buf: *[32]u21,
+                styles_map: *std.AutoHashMap(u32, redraw.UIEvent.Style.Attributes),
+                synth_cache: *std.AutoHashMap(redraw.UIEvent.Style.Attributes, u32),
+                next_id: *u32,
             ) ![]CellData {
                 const row = p.getRow(y);
                 const row_cells = p.getCells(row);
@@ -313,49 +320,82 @@ const ScreenState = struct {
                         continue;
                     }
 
-                    // Extract text
-                    var text: []const u8 = "";
-                    var cluster: []const u21 = &[_]u21{};
+                    // Check for direct color cells
+                    var effective_style_id: u32 = cell.style_id;
+                    var is_direct_color = false;
 
-                    switch (cell.content_tag) {
-                        .codepoint => {
-                            if (cell.content.codepoint != 0) {
-                                cluster = g_buf[0..1];
-                                g_buf[0] = cell.content.codepoint;
-                            }
-                        },
-                        .codepoint_grapheme => {
-                            g_buf[0] = cell.content.codepoint;
-                            var len: usize = 1;
-                            if (p.lookupGrapheme(cell)) |extra| {
-                                for (extra) |cp| {
-                                    if (len >= g_buf.len) break;
-                                    g_buf[len] = cp;
-                                    len += 1;
-                                }
-                            }
-                            cluster = g_buf[0..len];
-                        },
-                        .bg_color_palette, .bg_color_rgb => {
-                            cluster = &[_]u21{' '};
-                        },
+                    if (cell.content_tag == .bg_color_rgb or cell.content_tag == .bg_color_palette) {
+                        var attrs = redraw.UIEvent.Style.Attributes{};
+                        if (cell.content_tag == .bg_color_rgb) {
+                            const rgb = cell.content.color_rgb;
+                            attrs.bg = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | @as(u32, rgb.b);
+                        } else {
+                            attrs.bg_idx = cell.content.color_palette;
+                        }
+
+                        // Use synthetic ID
+                        if (synth_cache.get(attrs)) |id| {
+                            effective_style_id = id;
+                        } else {
+                            const id = next_id.*;
+                            next_id.* += 1;
+                            try synth_cache.put(attrs, id);
+                            try styles_map.put(id, attrs);
+                            effective_style_id = id;
+                        }
+                        is_direct_color = true;
                     }
 
-                    if (cluster.len > 0) {
-                        var utf8_list = std.ArrayList(u8).empty;
-                        defer utf8_list.deinit(alloc);
-                        for (cluster) |cp| {
-                            const len = std.unicode.utf8Encode(cp, u_buf) catch continue;
-                            try utf8_list.appendSlice(alloc, u_buf[0..len]);
-                        }
-                        text = try utf8_list.toOwnedSlice(alloc);
-                    } else {
+                    // Extract text
+                    var text: []const u8 = "";
+
+                    if (is_direct_color) {
                         text = try alloc.dupe(u8, " ");
+                    } else {
+                        var cluster: []const u21 = &[_]u21{};
+
+                        switch (cell.content_tag) {
+                            .codepoint => {
+                                if (cell.content.codepoint != 0) {
+                                    cluster = g_buf[0..1];
+                                    g_buf[0] = cell.content.codepoint;
+                                }
+                            },
+                            .codepoint_grapheme => {
+                                g_buf[0] = cell.content.codepoint;
+                                var len: usize = 1;
+                                if (p.lookupGrapheme(cell)) |extra| {
+                                    for (extra) |cp| {
+                                        if (len >= g_buf.len) break;
+                                        g_buf[len] = cp;
+                                        len += 1;
+                                    }
+                                }
+                                cluster = g_buf[0..len];
+                            },
+                            // Direct color tags handled above
+                            .bg_color_palette, .bg_color_rgb => {
+                                // Should have been handled by is_direct_color check but explicit case for switch completeness/fallthrough
+                                cluster = &[_]u21{' '};
+                            },
+                        }
+
+                        if (cluster.len > 0) {
+                            var utf8_list = std.ArrayList(u8).empty;
+                            defer utf8_list.deinit(alloc);
+                            for (cluster) |cp| {
+                                const len = std.unicode.utf8Encode(cp, u_buf) catch continue;
+                                try utf8_list.appendSlice(alloc, u_buf[0..len]);
+                            }
+                            text = try utf8_list.toOwnedSlice(alloc);
+                        } else {
+                            text = try alloc.dupe(u8, " ");
+                        }
                     }
 
                     cells[x] = .{
                         .text = text,
-                        .style_id = cell.style_id,
+                        .style_id = effective_style_id,
                         .wide = cell.wide == .wide,
                     };
                 }
@@ -377,7 +417,7 @@ const ScreenState = struct {
 
         if (capture_all) {
             for (0..rows) |y| {
-                const cells = try capture_row.call(allocator, page, y, cols, &utf8_buf, &grapheme_buf);
+                const cells = try capture_row.call(allocator, page, y, cols, &utf8_buf, &grapheme_buf, &styles, &synthetic_cache, &next_synthetic_id);
                 try rows_data.append(allocator, .{ .y = y, .cells = cells });
             }
 
@@ -393,17 +433,20 @@ const ScreenState = struct {
             var it = ds.iterator(.{});
             while (it.next()) |y| {
                 if (y >= rows) continue;
-                const cells = try capture_row.call(allocator, page, y, cols, &utf8_buf, &grapheme_buf);
+                const cells = try capture_row.call(allocator, page, y, cols, &utf8_buf, &grapheme_buf, &styles, &synthetic_cache, &next_synthetic_id);
                 try rows_data.append(allocator, .{ .y = y, .cells = cells });
             }
             ds.unsetAll();
         }
 
-        // Populate styles
+        // Populate styles (normal styles)
         for (rows_data.items) |row| {
             for (row.cells) |cell| {
                 if (cell.style_id != 0 and !styles.contains(cell.style_id)) {
-                    const attrs = convertStyle(allocator, terminal, cell.style_id);
+                    // Skip synthetic IDs (>= 65536) which are already populated
+                    if (cell.style_id >= 65536) continue;
+
+                    const attrs = convertStyle(allocator, terminal, @intCast(cell.style_id));
                     try styles.put(cell.style_id, attrs);
                 }
             }
