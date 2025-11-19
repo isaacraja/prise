@@ -79,13 +79,11 @@ pub fn main() !void {
     var app = try client.App.init(allocator);
     defer app.deinit();
 
+    app.socket_path = socket_path;
+
     try app.setup(&loop);
 
-    _ = try client.connectUnixSocket(
-        &loop,
-        socket_path,
-        .{ .ptr = &app, .cb = client.App.onConnected },
-    );
+    // Connection will be initiated after first winsize event from TTY
 
     try loop.run(.until_done);
 

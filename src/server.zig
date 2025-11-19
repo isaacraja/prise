@@ -755,18 +755,32 @@ const Server = struct {
     accept_task: ?io.Task = null,
     exit_on_idle: bool = false,
 
-    fn parseSpawnPtyParams(params: msgpack.Value) pty.winsize {
+    fn parseSpawnPtyParams(params: msgpack.Value) struct { size: pty.winsize, attach: bool } {
+        var rows: u16 = 24;
+        var cols: u16 = 80;
+        var attach: bool = false;
+
+        if (params == .map) {
+            for (params.map) |kv| {
+                if (kv.key != .string) continue;
+                if (std.mem.eql(u8, kv.key.string, "rows") and kv.value == .unsigned) {
+                    rows = @intCast(kv.value.unsigned);
+                } else if (std.mem.eql(u8, kv.key.string, "cols") and kv.value == .unsigned) {
+                    cols = @intCast(kv.value.unsigned);
+                } else if (std.mem.eql(u8, kv.key.string, "attach") and kv.value == .boolean) {
+                    attach = kv.value.boolean;
+                }
+            }
+        }
+
         return .{
-            .ws_row = if (params == .array and params.array.len > 0 and params.array[0] == .unsigned)
-                @intCast(params.array[0].unsigned)
-            else
-                24,
-            .ws_col = if (params == .array and params.array.len > 1 and params.array[1] == .unsigned)
-                @intCast(params.array[1].unsigned)
-            else
-                80,
-            .ws_xpixel = 0,
-            .ws_ypixel = 0,
+            .size = .{
+                .ws_row = rows,
+                .ws_col = cols,
+                .ws_xpixel = 0,
+                .ws_ypixel = 0,
+            },
+            .attach = attach,
         };
     }
 
@@ -829,7 +843,8 @@ const Server = struct {
         if (std.mem.eql(u8, method, "ping")) {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "pong") };
         } else if (std.mem.eql(u8, method, "spawn_pty")) {
-            const size = parseSpawnPtyParams(params);
+            const parsed = parseSpawnPtyParams(params);
+            std.log.info("spawn_pty: rows={} cols={} attach={}", .{ parsed.size.ws_row, parsed.size.ws_col, parsed.attach });
 
             const shell = std.posix.getenv("SHELL") orelse "/bin/sh";
 
@@ -846,12 +861,12 @@ const Server = struct {
                 env_list.deinit(self.allocator);
             }
 
-            const process = try pty.Process.spawn(self.allocator, size, &.{shell}, @ptrCast(env_list.items));
+            const process = try pty.Process.spawn(self.allocator, parsed.size, &.{shell}, @ptrCast(env_list.items));
 
             const session_id = self.next_session_id;
             self.next_session_id += 1;
 
-            const pty_instance = try Pty.init(self.allocator, session_id, process, size);
+            const pty_instance = try Pty.init(self.allocator, session_id, process, parsed.size);
             pty_instance.server_ptr = self;
 
             try self.ptys.put(session_id, pty_instance);
@@ -863,6 +878,17 @@ const Server = struct {
                 .ptr = pty_instance,
                 .cb = onPtyDirty,
             });
+
+            if (parsed.attach) {
+                try client.attached_sessions.append(self.allocator, session_id);
+
+                // Send initial redraw
+                std.log.info("Sending initial redraw for session {}", .{session_id});
+                var state = try ScreenState.init(self.allocator, &pty_instance.terminal, &pty_instance.terminal_mutex, .full, pty_instance.last_viewport);
+                defer state.deinit();
+                std.log.info("ScreenState: rows={} cols={}", .{ state.rows, state.cols });
+                try self.sendRedraw(self.loop, pty_instance, &state, client, .full);
+            }
 
             std.log.info("Created session {} with PID {}", .{ session_id, process.pid });
 
@@ -1608,19 +1634,21 @@ test "parseSpawnPtyParams" {
     const testing = std.testing;
 
     // Empty params - defaults
-    var empty_args = [_]msgpack.Value{};
-    const p1 = Server.parseSpawnPtyParams(.{ .array = &empty_args });
-    try testing.expectEqual(@as(u16, 24), p1.ws_row);
-    try testing.expectEqual(@as(u16, 80), p1.ws_col);
+    const p1 = Server.parseSpawnPtyParams(.{ .map = &.{} });
+    try testing.expectEqual(@as(u16, 24), p1.size.ws_row);
+    try testing.expectEqual(@as(u16, 80), p1.size.ws_col);
+    try testing.expectEqual(false, p1.attach);
 
     // Full params
-    var args = [_]msgpack.Value{
-        .{ .unsigned = 40 },
-        .{ .unsigned = 100 },
+    var params = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = 40 } },
+        .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = 100 } },
+        .{ .key = .{ .string = "attach" }, .value = .{ .boolean = true } },
     };
-    const p2 = Server.parseSpawnPtyParams(.{ .array = &args });
-    try testing.expectEqual(@as(u16, 40), p2.ws_row);
-    try testing.expectEqual(@as(u16, 100), p2.ws_col);
+    const p2 = Server.parseSpawnPtyParams(.{ .map = &params });
+    try testing.expectEqual(@as(u16, 40), p2.size.ws_row);
+    try testing.expectEqual(@as(u16, 100), p2.size.ws_col);
+    try testing.expectEqual(true, p2.attach);
 }
 
 test "prepareSpawnEnv" {

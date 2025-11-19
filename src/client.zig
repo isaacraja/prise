@@ -194,7 +194,10 @@ pub const ClientLogic = struct {
                         .unsigned => |u| {
                             if (state.pty_id == null) {
                                 state.pty_id = @intCast(u);
-                                return ServerAction{ .send_attach = @intCast(u) };
+                                // We spawned with attach=true, so we're already attached
+                                state.attached = true;
+                                std.log.info("Spawned and attached to session {}", .{u});
+                                return .attached;
                             } else if (!state.attached) {
                                 state.attached = true;
                                 std.log.info("Attached to session", .{});
@@ -249,6 +252,7 @@ pub const ClientLogic = struct {
                 .integer => |i| @as(u16, @intCast(i)),
                 else => return .none,
             };
+            std.log.info("processPipeMessage: resize {}x{}", .{ rows, cols });
             return PipeAction{ .send_resize = .{ .rows = rows, .cols = cols } };
         } else if (std.mem.eql(u8, msg_type.string, "quit")) {
             state.should_quit = true;
@@ -402,6 +406,8 @@ pub const App = struct {
     surface: ?Surface = null,
     state: ClientState = ClientState.init(),
     ui: UI = undefined,
+    first_resize_done: bool = false,
+    socket_path: []const u8 = undefined,
 
     pipe_read_fd: posix.fd_t = undefined,
     pipe_write_fd: posix.fd_t = undefined,
@@ -503,11 +509,26 @@ pub const App = struct {
             std.log.err("Failed to start vaxis loop: {}", .{err});
             return;
         };
-        self.vx.queryTerminal(self.tty.writer(), 1 * std.time.ns_per_s) catch |err| {
+        // TODO: queryTerminal blocks for the full timeout waiting for unsupported capability
+        // responses. This adds ~20ms to startup. Consider skipping or doing asynchronously.
+        const start = std.time.milliTimestamp();
+        std.log.info("Starting queryTerminal...", .{});
+        self.vx.queryTerminal(self.tty.writer(), 20 * std.time.ns_per_ms) catch |err| {
             std.log.err("Failed to query terminal: {}", .{err});
             return;
         };
-        std.log.info("Vaxis loop started in TTY thread", .{});
+        const elapsed = std.time.milliTimestamp() - start;
+        std.log.info("Vaxis loop started in TTY thread (queryTerminal took {}ms)", .{elapsed});
+
+        // Send initial winsize event manually
+        const ws = vaxis.Tty.getWinsize(self.tty.fd) catch |err| {
+            std.log.err("Failed to get initial winsize: {}", .{err});
+            return;
+        };
+        std.log.info("Sending initial winsize: {}x{}", .{ ws.rows, ws.cols });
+        self.forwardEventToPipe(.{ .winsize = ws }) catch |err| {
+            std.log.err("Failed to forward initial winsize: {}", .{err});
+        };
 
         while (!self.state.should_quit) {
             std.log.debug("Waiting for next event...", .{});
@@ -606,27 +627,27 @@ pub const App = struct {
         const action = try ClientLogic.processPipeMessage(&self.state, value);
 
         switch (action) {
-            .send_key => |key_map| {
-                if (self.state.pty_id) |pty_id| {
-                    // Build the notification array manually
-                    var arr = try self.allocator.alloc(msgpack.Value, 3);
-                    defer self.allocator.free(arr);
-                    arr[0] = .{ .unsigned = 2 }; // notification
-                    arr[1] = .{ .string = "key_input" };
-
-                    var params = try self.allocator.alloc(msgpack.Value, 2);
-                    defer self.allocator.free(params);
-                    params[0] = .{ .unsigned = @intCast(pty_id) };
-                    params[1] = key_map;
-
-                    arr[2] = .{ .array = params };
-
-                    const msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
-                    defer self.allocator.free(msg);
-                    try self.sendDirect(msg);
-                }
-            },
             .send_resize => |size| {
+                // First resize - initialize vaxis and surface, then connect
+                if (!self.first_resize_done) {
+                    self.first_resize_done = true;
+                    std.log.info("First resize event: {}x{}, initializing and connecting", .{ size.cols, size.rows });
+
+                    // Resize vaxis
+                    self.performResize(size.rows, size.cols);
+
+                    // Now connect to server
+                    if (self.io_loop) |loop| {
+                        std.log.info("Connecting to server at {s}", .{self.socket_path});
+                        _ = try connectUnixSocket(loop, self.socket_path, .{
+                            .ptr = self,
+                            .cb = onConnected,
+                        });
+                    }
+                    return;
+                }
+
+                // Subsequent resizes - check if we need to resize
                 std.log.info("Resize event: {}x{}", .{ size.cols, size.rows });
 
                 if (self.surface) |surface| {
@@ -658,8 +679,28 @@ pub const App = struct {
                     defer self.allocator.free(msg);
                     try self.sendDirect(msg);
                 } else {
-                    // Not attached, resize immediately
+                    // Not attached yet, just resize locally
                     self.performResize(size.rows, size.cols);
+                }
+            },
+            .send_key => |key_map| {
+                if (self.state.pty_id) |pty_id| {
+                    // Build the notification array manually
+                    var arr = try self.allocator.alloc(msgpack.Value, 3);
+                    defer self.allocator.free(arr);
+                    arr[0] = .{ .unsigned = 2 }; // notification
+                    arr[1] = .{ .string = "key_input" };
+
+                    var params = try self.allocator.alloc(msgpack.Value, 2);
+                    defer self.allocator.free(params);
+                    params[0] = .{ .unsigned = @intCast(pty_id) };
+                    params[1] = key_map;
+
+                    arr[2] = .{ .array = params };
+
+                    const msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
+                    defer self.allocator.free(msg);
+                    try self.sendDirect(msg);
                 }
             },
             .quit => {
@@ -720,12 +761,20 @@ pub const App = struct {
 
             // Check if we got a flush event - if so, swap and render
             if (params == .array) {
-                if (ClientLogic.shouldFlush(params)) {
+                const should_flush = ClientLogic.shouldFlush(params);
+                std.log.debug("handleRedraw: params is array, shouldFlush={}", .{should_flush});
+                if (should_flush) {
                     std.log.debug("handleRedraw: flush event received, rendering", .{});
                     try self.render();
                     return;
+                } else {
+                    std.log.debug("handleRedraw: no flush event, not rendering yet", .{});
                 }
+            } else {
+                std.log.debug("handleRedraw: params is not array", .{});
             }
+        } else {
+            std.log.warn("handleRedraw: no surface, ignoring redraw", .{});
         }
     }
 
@@ -782,7 +831,23 @@ pub const App = struct {
                         .cb = onRecv,
                     });
 
-                    app.send_buffer = try msgpack.encode(app.allocator, .{ 0, @intFromEnum(MsgId.spawn_pty), "spawn_pty", .{} });
+                    // Vaxis and surface are already initialized from first winsize event
+                    const ws = try vaxis.Tty.getWinsize(app.tty.fd);
+
+                    var params_kv = try app.allocator.alloc(msgpack.Value.KeyValue, 3);
+                    defer app.allocator.free(params_kv);
+                    std.log.info("Sending spawn_pty: rows={} cols={}", .{ ws.rows, ws.cols });
+                    params_kv[0] = .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = ws.rows } };
+                    params_kv[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = ws.cols } };
+                    params_kv[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = true } };
+                    const params_val = msgpack.Value{ .map = params_kv };
+                    var arr = try app.allocator.alloc(msgpack.Value, 4);
+                    defer app.allocator.free(arr);
+                    arr[0] = .{ .unsigned = 0 };
+                    arr[1] = .{ .unsigned = @intFromEnum(MsgId.spawn_pty) };
+                    arr[2] = .{ .string = "spawn_pty" };
+                    arr[3] = params_val;
+                    app.send_buffer = try msgpack.encodeFromValue(app.allocator, msgpack.Value{ .array = arr });
 
                     app.send_task = try l.send(fd, app.send_buffer.?, .{
                         .ptr = app,
@@ -879,6 +944,16 @@ pub const App = struct {
                                 app.ui.update(.{ .pty_attach = @intCast(pty_id) }) catch |err| {
                                     std.log.err("Failed to update UI with pty_attach: {}", .{err});
                                 };
+
+                                // Ensure surface exists
+                                if (app.surface == null) {
+                                    const ws = try vaxis.Tty.getWinsize(app.tty.fd);
+                                    std.log.info("Creating surface for attached session: {}x{}", .{ ws.rows, ws.cols });
+                                    app.surface = Surface.init(app.allocator, ws.rows, ws.cols) catch |err| {
+                                        std.log.err("Failed to create surface: {}", .{err});
+                                        return error.SurfaceInitFailed;
+                                    };
+                                }
 
                                 if (app.surface) |*surface| {
                                     std.log.info("Sending initial resize: {}x{}", .{ surface.rows, surface.cols });
@@ -1020,7 +1095,7 @@ test "ClientLogic - encodeEvent" {
         try testing.expectEqual(std.meta.Tag(msgpack.Value).array, std.meta.activeTag(val));
         try testing.expectEqual(2, val.array.len);
         try testing.expectEqualStrings("key", val.array[0].string);
-        try testing.expectEqualStrings("a", val.array[1].string);
+        try testing.expectEqual(std.meta.Tag(msgpack.Value).map, std.meta.activeTag(val.array[1]));
     }
 
     // Test Resize

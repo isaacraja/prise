@@ -341,7 +341,7 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
 pub fn render(self: *Surface, win: vaxis.Window) void {
     if (!self.dirty) return;
 
-    std.log.debug("render: copying front→vaxis window", .{});
+    std.log.debug("render: copying front→vaxis window (win={}x{}, surface={}x{})", .{ win.width, win.height, self.cols, self.rows });
 
     var cells_written: usize = 0;
     // Copy front buffer to vaxis window
