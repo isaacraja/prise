@@ -396,16 +396,18 @@ const ScreenState = struct {
 
                 // Optimization: check if it's the same as the last one
                 var style_id: u32 = 0;
+                var found_match = false;
 
                 if (last_style_key) |last| {
                     // Manual equality check for StyleKey since it has padding
                     const style_eq = std.meta.eql(last.style, style_key.style);
                     if (style_eq and last.selected == style_key.selected) {
                         style_id = last_style_id;
+                        found_match = true;
                     }
                 }
 
-                if (style_id == 0 and !(last_style_key != null and last_style_id == 0)) {
+                if (!found_match) {
                     // Not cached or cached as 0 (which is default, so we still need to verify if it's truly default or new)
                     // Actually if it was cached as 0, and matched, we would have broken out above.
                     // But wait, initial last_style_id is 0.
@@ -1843,4 +1845,69 @@ test "buildRedrawMessage" {
     defer testing.allocator.free(msg);
 
     try testing.expect(msg.len > 0);
+}
+
+test "ScreenState style optimization" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var terminal = try ghostty_vt.Terminal.init(allocator, .{ .cols = 10, .rows = 2 });
+    defer terminal.deinit(allocator);
+
+    const handler = vt_handler.Handler.init(&terminal);
+    var stream = vt_handler.Stream.initAlloc(allocator, handler);
+    defer stream.deinit();
+
+    // Row 0: A (Default), B (Red), C (Default)
+    try stream.nextSlice(&[_]u8{'A'});
+
+    // B (Red)
+    try stream.nextSlice("\x1b[31m");
+    try stream.nextSlice(&[_]u8{'B'});
+
+    // C (Default)
+    try stream.nextSlice("\x1b[0m");
+    try stream.nextSlice(&[_]u8{'C'});
+
+    // Newline to start Row 1
+    try stream.nextSlice("\r\n");
+
+    // D (Red) - testing switching from Default (C) to Red (D) across rows/cells
+    try stream.nextSlice("\x1b[31m");
+    try stream.nextSlice(&[_]u8{'D'});
+
+    var mutex = std.Thread.Mutex{};
+    var state = try ScreenState.init(allocator, &terminal, &mutex, .full, null);
+    defer state.deinit();
+
+    // Find row 0 and 1
+    var row0: ?ScreenState.DirtyRow = null;
+    var row1: ?ScreenState.DirtyRow = null;
+
+    for (state.rows_data) |row| {
+        if (row.y == 0) row0 = row;
+        if (row.y == 1) row1 = row;
+    }
+
+    try testing.expect(row0 != null);
+    const r0 = row0.?;
+    try testing.expectEqualStrings("A", r0.cells[0].text);
+    const style_default_id = r0.cells[0].style_id;
+
+    try testing.expectEqualStrings("B", r0.cells[1].text);
+    const red_style_id = r0.cells[1].style_id;
+    try testing.expect(red_style_id != style_default_id);
+
+    try testing.expectEqualStrings("C", r0.cells[2].text);
+    try testing.expectEqual(style_default_id, r0.cells[2].style_id);
+
+    try testing.expect(row1 != null);
+    const r1 = row1.?;
+    try testing.expectEqualStrings("D", r1.cells[0].text);
+    const d_style_id = r1.cells[0].style_id;
+
+    // D should have the same Red style ID as B
+    try testing.expectEqual(red_style_id, d_style_id);
+    // And definitely not the default style ID
+    try testing.expect(d_style_id != style_default_id);
 }
