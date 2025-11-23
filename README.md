@@ -34,6 +34,12 @@ To run tests:
 zig build test
 ```
 
+To format code:
+
+```bash
+zig build fmt
+```
+
 ## Requirements
 
 The following binaries are required for development:
