@@ -179,6 +179,76 @@ local function get_focused_pty()
     return nil
 end
 
+-- Serialize a node tree to a table with pty_ids instead of userdata
+local function serialize_node(node)
+    if not node then
+        return nil
+    end
+    if is_pane(node) then
+        return {
+            type = "pane",
+            id = node.id,
+            pty_id = node.pty:id(),
+            ratio = node.ratio,
+        }
+    elseif is_split(node) then
+        local children = {}
+        for _, child in ipairs(node.children) do
+            table.insert(children, serialize_node(child))
+        end
+        return {
+            type = "split",
+            split_id = node.split_id,
+            direction = node.direction,
+            ratio = node.ratio,
+            children = children,
+        }
+    end
+    return nil
+end
+
+-- Deserialize a node tree, looking up PTYs by id
+local function deserialize_node(saved, pty_lookup)
+    if not saved then
+        return nil
+    end
+    if saved.type == "pane" then
+        local pty = pty_lookup(saved.pty_id)
+        if not pty then
+            return nil
+        end
+        return {
+            type = "pane",
+            id = saved.id,
+            pty = pty,
+            ratio = saved.ratio,
+        }
+    elseif saved.type == "split" then
+        local children = {}
+        for _, child in ipairs(saved.children) do
+            local restored = deserialize_node(child, pty_lookup)
+            if restored then
+                table.insert(children, restored)
+            end
+        end
+        if #children == 0 then
+            return nil
+        elseif #children == 1 then
+            local survivor = children[1]
+            survivor.ratio = saved.ratio
+            return survivor
+        end
+        return {
+            type = "split",
+            split_id = saved.split_id,
+            direction = saved.direction,
+            ratio = saved.ratio,
+            children = children,
+        }
+    end
+    return nil
+end
+
 local function resize_pane(dimension, delta_ratio)
     if not state.focused_id or not state.root then
         return
@@ -380,6 +450,10 @@ function M.update(event)
                 prise.spawn({})
                 state.pending_split = { direction = "col" }
                 handled = true
+            elseif k == "d" then
+                -- Detach from session
+                prise.detach("default")
+                handled = true
             end
 
             if handled then
@@ -578,6 +652,32 @@ function M.view()
             }),
         },
     })
+end
+
+function M.get_state()
+    return {
+        root = serialize_node(state.root),
+        focused_id = state.focused_id,
+        next_split_id = state.next_split_id,
+    }
+end
+
+function M.set_state(saved, pty_lookup)
+    if not saved then
+        return
+    end
+    state.root = deserialize_node(saved.root, pty_lookup)
+    state.focused_id = saved.focused_id
+    state.next_split_id = saved.next_split_id or 1
+
+    if state.root and not state.focused_id then
+        local first = get_first_leaf(state.root)
+        if first then
+            state.focused_id = first.id
+        end
+    end
+
+    prise.request_frame()
 end
 
 return M

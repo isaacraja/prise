@@ -509,3 +509,24 @@ pub fn getPtyId(lua: *ziglua.Lua, index: i32) !u32 {
 
     return error.InvalidPty;
 }
+
+pub fn pushPtyUserdata(
+    lua: *ziglua.Lua,
+    id: u32,
+    surface: *Surface,
+    app: *anyopaque,
+    send_key_fn: *const fn (app: *anyopaque, id: u32, key: KeyData) anyerror!void,
+    send_mouse_fn: *const fn (app: *anyopaque, id: u32, mouse: MouseData) anyerror!void,
+) !void {
+    const pty = lua.newUserdata(PtyHandle, @sizeOf(PtyHandle));
+    pty.* = .{
+        .id = id,
+        .surface = surface,
+        .app = app,
+        .send_key_fn = send_key_fn,
+        .send_mouse_fn = send_mouse_fn,
+    };
+
+    _ = lua.getMetatableRegistry("PrisePty");
+    lua.setMetatable(-2);
+}

@@ -233,11 +233,11 @@ const Pty = struct {
 
             if (poll_fds[1].revents & posix.POLL.IN != 0) break; // Exit signal received
         }
-        std.log.info("PTY read thread exiting for session {}", .{self.id});
+        std.log.info("PTY read thread exiting for PTY {}", .{self.id});
 
         // Reap the child process
         const result = posix.waitpid(self.process.pid, 0);
-        std.log.info("Session {} PTY process {} exited with status {}", .{ self.id, self.process.pid, result.status });
+        std.log.info("PTY {} process {} exited with status {}", .{ self.id, self.process.pid, result.status });
 
         self.exit_status.store(result.status, .seq_cst);
         self.exited.store(true, .seq_cst);
@@ -701,11 +701,11 @@ const Client = struct {
                 // Handle notifications (no response needed)
                 if (std.mem.eql(u8, notif.method, "write_pty")) {
                     if (notif.params == .array and notif.params.array.len >= 2) {
-                        const session_id: usize = switch (notif.params.array[0]) {
+                        const pty_id: usize = switch (notif.params.array[0]) {
                             .unsigned => |u| @intCast(u),
                             .integer => |i| @intCast(i),
                             else => {
-                                std.log.warn("write_pty notification: invalid session_id type", .{});
+                                std.log.warn("write_pty notification: invalid pty_id type", .{});
                                 return;
                             },
                         };
@@ -718,29 +718,29 @@ const Client = struct {
                             return;
                         };
 
-                        if (self.server.ptys.get(session_id)) |pty_instance| {
+                        if (self.server.ptys.get(pty_id)) |pty_instance| {
                             _ = posix.write(pty_instance.process.master, input_data) catch |err| {
                                 std.log.err("Write to PTY failed: {}", .{err});
                             };
                         } else {
-                            std.log.warn("write_pty notification: session {} not found", .{session_id});
+                            std.log.warn("write_pty notification: PTY {} not found", .{pty_id});
                         }
                     } else {
                         std.log.warn("write_pty notification: invalid params", .{});
                     }
                 } else if (std.mem.eql(u8, notif.method, "key_input")) {
                     if (notif.params == .array and notif.params.array.len >= 2) {
-                        const session_id: usize = switch (notif.params.array[0]) {
+                        const pty_id: usize = switch (notif.params.array[0]) {
                             .unsigned => |u| @intCast(u),
                             .integer => |i| @intCast(i),
                             else => {
-                                std.log.warn("key_input notification: invalid session_id type", .{});
+                                std.log.warn("key_input notification: invalid pty_id type", .{});
                                 return;
                             },
                         };
                         const key_map = notif.params.array[1];
 
-                        if (self.server.ptys.get(session_id)) |pty_instance| {
+                        if (self.server.ptys.get(pty_id)) |pty_instance| {
                             const key = key_parse.parseKeyMap(key_map) catch |err| {
                                 std.log.err("Failed to parse key map: {}", .{err});
                                 return;
@@ -764,24 +764,24 @@ const Client = struct {
                                 };
                             }
                         } else {
-                            std.log.warn("key_input notification: session {} not found", .{session_id});
+                            std.log.warn("key_input notification: PTY {} not found", .{pty_id});
                         }
                     } else {
                         std.log.warn("key_input notification: invalid params", .{});
                     }
                 } else if (std.mem.eql(u8, notif.method, "mouse_input")) {
                     if (notif.params == .array and notif.params.array.len >= 2) {
-                        const session_id: usize = switch (notif.params.array[0]) {
+                        const pty_id: usize = switch (notif.params.array[0]) {
                             .unsigned => |u| @intCast(u),
                             .integer => |i| @intCast(i),
                             else => {
-                                std.log.warn("mouse_input notification: invalid session_id type", .{});
+                                std.log.warn("mouse_input notification: invalid pty_id type", .{});
                                 return;
                             },
                         };
                         const mouse_map = notif.params.array[1];
 
-                        if (self.server.ptys.get(session_id)) |pty_instance| {
+                        if (self.server.ptys.get(pty_id)) |pty_instance| {
                             const mouse = key_parse.parseMouseMap(mouse_map) catch |err| {
                                 std.log.err("Failed to parse mouse map: {}", .{err});
                                 return;
@@ -955,18 +955,18 @@ const Client = struct {
                                 }
                             }
                         } else {
-                            std.log.warn("mouse_input notification: session {} not found", .{session_id});
+                            std.log.warn("mouse_input notification: PTY {} not found", .{pty_id});
                         }
                     } else {
                         std.log.warn("mouse_input notification: invalid params", .{});
                     }
                 } else if (std.mem.eql(u8, notif.method, "resize_pty")) {
                     if (notif.params == .array and notif.params.array.len >= 3) {
-                        const session_id: usize = switch (notif.params.array[0]) {
+                        const pty_id: usize = switch (notif.params.array[0]) {
                             .unsigned => |u| @intCast(u),
                             .integer => |i| @intCast(i),
                             else => {
-                                std.log.warn("resize_pty notification: invalid session_id type", .{});
+                                std.log.warn("resize_pty notification: invalid pty_id type", .{});
                                 return;
                             },
                         };
@@ -1003,9 +1003,9 @@ const Client = struct {
                             };
                         }
 
-                        if (self.server.ptys.get(session_id)) |pty_instance| {
-                            std.log.info("resize_pty: session={} requested={}x{} ({}x{}px) current_terminal={}x{}", .{
-                                session_id,
+                        if (self.server.ptys.get(pty_id)) |pty_instance| {
+                            std.log.info("resize_pty: pty={} requested={}x{} ({}x{}px) current_terminal={}x{}", .{
+                                pty_id,
                                 cols,
                                 rows,
                                 x_pixel,
@@ -1068,12 +1068,55 @@ const Client = struct {
                             // The normal PTY dirty handling will send updates after the app redraws
                             pty_instance.render_state.dirty = .full;
                             pty_instance.terminal_mutex.unlock();
-                            std.log.info("resize_pty: completed for session={}", .{session_id});
+                            std.log.info("resize_pty: completed for pty={}", .{pty_id});
                         } else {
-                            std.log.warn("resize_pty notification: session {} not found", .{session_id});
+                            std.log.warn("resize_pty notification: PTY {} not found", .{pty_id});
                         }
                     } else {
                         std.log.warn("resize_pty notification: invalid params", .{});
+                    }
+                } else if (std.mem.eql(u8, notif.method, "detach_pty")) {
+                    if (notif.params == .array and notif.params.array.len >= 2) {
+                        const pty_id: usize = switch (notif.params.array[0]) {
+                            .unsigned => |u| @intCast(u),
+                            .integer => |i| @intCast(i),
+                            else => {
+                                std.log.warn("detach_pty notification: invalid pty_id type", .{});
+                                return;
+                            },
+                        };
+                        const client_fd: posix.fd_t = switch (notif.params.array[1]) {
+                            .unsigned => |u| @intCast(u),
+                            .integer => |i| @intCast(i),
+                            else => {
+                                std.log.warn("detach_pty notification: invalid client_fd type", .{});
+                                return;
+                            },
+                        };
+
+                        if (self.server.ptys.get(pty_id)) |pty_instance| {
+                            // Mark PTY as keep_alive since client explicitly detached
+                            pty_instance.keep_alive = true;
+
+                            // Find client by fd and detach
+                            for (self.server.clients.items) |c| {
+                                if (c.fd == client_fd) {
+                                    pty_instance.removeClient(c);
+                                    for (c.attached_sessions.items, 0..) |sid, i| {
+                                        if (sid == pty_id) {
+                                            _ = c.attached_sessions.swapRemove(i);
+                                            break;
+                                        }
+                                    }
+                                    std.log.info("Client {} detached from PTY {} (marked keep_alive)", .{ c.fd, pty_id });
+                                    break;
+                                }
+                            }
+                        } else {
+                            std.log.warn("detach_pty notification: PTY {} not found", .{pty_id});
+                        }
+                    } else {
+                        std.log.warn("detach_pty notification: invalid params", .{});
                     }
                 }
             },
@@ -1123,7 +1166,7 @@ const Server = struct {
     socket_path: []const u8,
     clients: std.ArrayList(*Client),
     ptys: std.AutoHashMap(usize, *Pty),
-    next_session_id: usize = 0,
+    next_pty_id: usize = 0,
     accepting: bool = true,
     accept_task: ?io.Task = null,
     exit_on_idle: bool = false,
@@ -1173,10 +1216,10 @@ const Server = struct {
     }
 
     fn parseAttachPtyParams(params: msgpack.Value) !usize {
-        return parseSessionId(params);
+        return parsePtyId(params);
     }
 
-    fn parseSessionId(params: msgpack.Value) !usize {
+    fn parsePtyId(params: msgpack.Value) !usize {
         if (params != .array or params.array.len < 1) {
             return error.InvalidParams;
         }
@@ -1261,13 +1304,13 @@ const Server = struct {
 
             const process = try pty.Process.spawn(self.allocator, parsed.size, &.{shell}, @ptrCast(env_list.items));
 
-            const session_id = self.next_session_id;
-            self.next_session_id += 1;
+            const pty_id = self.next_pty_id;
+            self.next_pty_id += 1;
 
-            const pty_instance = try Pty.init(self.allocator, session_id, process, parsed.size);
+            const pty_instance = try Pty.init(self.allocator, pty_id, process, parsed.size);
             pty_instance.server_ptr = self;
 
-            try self.ptys.put(session_id, pty_instance);
+            try self.ptys.put(pty_id, pty_instance);
 
             pty_instance.read_thread = try std.Thread.spawn(.{}, Pty.readThread, .{ pty_instance, self });
 
@@ -1278,35 +1321,35 @@ const Server = struct {
             });
 
             if (parsed.attach) {
-                try client.attached_sessions.append(self.allocator, session_id);
+                try client.attached_sessions.append(self.allocator, pty_id);
 
                 // Send initial redraw
-                std.log.info("Sending initial redraw for session {}", .{session_id});
+                std.log.info("Sending initial redraw for PTY {}", .{pty_id});
                 const msg = try buildRedrawMessageFromPty(self.allocator, pty_instance, .full);
                 defer self.allocator.free(msg);
                 try self.sendRedraw(self.loop, pty_instance, msg, client);
             }
 
-            std.log.info("Created session {} with PID {}", .{ session_id, process.pid });
+            std.log.info("Created PTY {} with PID {}", .{ pty_id, process.pid });
 
-            return msgpack.Value{ .unsigned = session_id };
+            return msgpack.Value{ .unsigned = pty_id };
         } else if (std.mem.eql(u8, method, "attach_pty")) {
             std.log.info("attach_pty called with params: {}", .{params});
-            const session_id = parseAttachPtyParams(params) catch |err| {
+            const pty_id = parseAttachPtyParams(params) catch |err| {
                 std.log.warn("attach_pty: invalid params: {}", .{err});
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
             };
 
-            std.log.info("attach_pty: session_id={} client_fd={}", .{ session_id, client.fd });
+            std.log.info("attach_pty: pty_id={} client_fd={}", .{ pty_id, client.fd });
 
-            const pty_instance = self.ptys.get(session_id) orelse {
-                std.log.warn("attach_pty: session {} not found", .{session_id});
-                return msgpack.Value{ .string = try self.allocator.dupe(u8, "session not found") };
+            const pty_instance = self.ptys.get(pty_id) orelse {
+                std.log.warn("attach_pty: PTY {} not found", .{pty_id});
+                return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
             };
 
             try pty_instance.addClient(self.allocator, client);
-            try client.attached_sessions.append(self.allocator, session_id);
-            std.log.info("Client {} attached to session {}", .{ client.fd, session_id });
+            try client.attached_sessions.append(self.allocator, pty_id);
+            std.log.info("Client {} attached to PTY {}", .{ client.fd, pty_id });
 
             // Send full redraw to the newly attached client
             const msg = try buildRedrawMessageFromPty(
@@ -1318,16 +1361,16 @@ const Server = struct {
 
             try self.sendRedraw(self.loop, pty_instance, msg, client);
 
-            return msgpack.Value{ .unsigned = session_id };
+            return msgpack.Value{ .unsigned = pty_id };
         } else if (std.mem.eql(u8, method, "write_pty")) {
             const args = parseWritePtyParams(params) catch {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
             };
-            const session_id = args.id;
+            const pty_id = args.id;
             const data = args.data;
 
-            const pty_instance = self.ptys.get(session_id) orelse {
-                return msgpack.Value{ .string = try self.allocator.dupe(u8, "session not found") };
+            const pty_instance = self.ptys.get(pty_id) orelse {
+                return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
             };
 
             _ = posix.write(pty_instance.process.master, data) catch |err| {
@@ -1340,18 +1383,18 @@ const Server = struct {
             const args = parseResizePtyParams(params) catch {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
             };
-            const session_id = args.id;
+            const pty_id = args.id;
             const rows = args.rows;
             const cols = args.cols;
             const x_pixel = args.x_pixel;
             const y_pixel = args.y_pixel;
 
-            const pty_instance = self.ptys.get(session_id) orelse {
-                return msgpack.Value{ .string = try self.allocator.dupe(u8, "session not found") };
+            const pty_instance = self.ptys.get(pty_id) orelse {
+                return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
             };
 
-            std.log.info("resize_pty request: session={} requested={}x{} ({}x{}px) current={}x{}", .{
-                session_id,
+            std.log.info("resize_pty request: pty={} requested={}x{} ({}x{}px) current={}x{}", .{
+                pty_id,
                 cols,
                 rows,
                 x_pixel,
@@ -1417,20 +1460,20 @@ const Server = struct {
             pty_instance.render_state.dirty = .full;
             pty_instance.terminal_mutex.unlock();
 
-            std.log.info("Resized session {} to {}x{} ({}x{}px)", .{ session_id, cols, rows, x_pixel, y_pixel });
+            std.log.info("Resized PTY {} to {}x{} ({}x{}px)", .{ pty_id, cols, rows, x_pixel, y_pixel });
             return msgpack.Value.nil;
         } else if (std.mem.eql(u8, method, "detach_pty")) {
             const args = parseDetachPtyParams(params) catch {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
             };
-            const session_id = args.id;
+            const pty_id = args.id;
             const client_fd = args.client_fd;
 
-            const pty_instance = self.ptys.get(session_id) orelse {
-                return msgpack.Value{ .string = try self.allocator.dupe(u8, "session not found") };
+            const pty_instance = self.ptys.get(pty_id) orelse {
+                return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
             };
 
-            // Mark session as keep_alive since client explicitly detached
+            // Mark PTY as keep_alive since client explicitly detached
             pty_instance.keep_alive = true;
 
             // Find client by fd and detach
@@ -1438,24 +1481,24 @@ const Server = struct {
                 if (c.fd == client_fd) {
                     pty_instance.removeClient(c);
                     for (c.attached_sessions.items, 0..) |sid, i| {
-                        if (sid == session_id) {
+                        if (sid == pty_id) {
                             _ = c.attached_sessions.swapRemove(i);
                             break;
                         }
                     }
-                    std.log.info("Client {} detached from session {} (marked keep_alive)", .{ c.fd, session_id });
+                    std.log.info("Client {} detached from PTY {} (marked keep_alive)", .{ c.fd, pty_id });
                     break;
                 }
             }
 
             return msgpack.Value.nil;
         } else if (std.mem.eql(u8, method, "get_selection")) {
-            const session_id = parseSessionId(params) catch {
+            const pty_id = parsePtyId(params) catch {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
             };
 
-            const pty_instance = self.ptys.get(session_id) orelse {
-                return msgpack.Value{ .string = try self.allocator.dupe(u8, "session not found") };
+            const pty_instance = self.ptys.get(pty_id) orelse {
+                return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
             };
 
             pty_instance.terminal_mutex.lock();
@@ -1476,12 +1519,12 @@ const Server = struct {
 
             return msgpack.Value{ .string = result };
         } else if (std.mem.eql(u8, method, "clear_selection")) {
-            const session_id = parseSessionId(params) catch {
+            const pty_id = parsePtyId(params) catch {
                 return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
             };
 
-            const pty_instance = self.ptys.get(session_id) orelse {
-                return msgpack.Value{ .string = try self.allocator.dupe(u8, "session not found") };
+            const pty_instance = self.ptys.get(pty_id) orelse {
+                return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
             };
 
             pty_instance.terminal_mutex.lock();
@@ -1501,23 +1544,23 @@ const Server = struct {
         return self.exit_on_idle and self.clients.items.len == 0;
     }
 
-    fn cleanupSessionsForClient(self: *Server, client: *Client) void {
+    fn cleanupPtysForClient(self: *Server, client: *Client) void {
         var to_remove = std.ArrayList(usize).empty;
         defer to_remove.deinit(self.allocator);
 
-        for (client.attached_sessions.items) |session_id| {
-            if (self.ptys.get(session_id)) |pty_instance| {
+        for (client.attached_sessions.items) |pty_id| {
+            if (self.ptys.get(pty_id)) |pty_instance| {
                 pty_instance.removeClient(client);
-                std.log.info("Auto-removed client {} from session {}", .{ client.fd, session_id });
+                std.log.info("Auto-removed client {} from PTY {}", .{ client.fd, pty_id });
 
-                // If no more clients attached and not marked keep_alive, kill the session
+                // If no more clients attached and not marked keep_alive, kill the PTY
                 if (pty_instance.clients.items.len == 0 and !pty_instance.keep_alive) {
-                    to_remove.append(self.allocator, session_id) catch {};
+                    to_remove.append(self.allocator, pty_id) catch {};
                 }
             }
         }
 
-        // Also cleanup any orphaned sessions with no clients and not keep_alive
+        // Also cleanup any orphaned PTYs with no clients and not keep_alive
         var it = self.ptys.iterator();
         while (it.next()) |entry| {
             const pty_instance = entry.value_ptr.*;
@@ -1526,9 +1569,9 @@ const Server = struct {
             }
         }
 
-        for (to_remove.items) |session_id| {
-            if (self.ptys.getPtr(session_id)) |pty_ptr| {
-                std.log.info("Killing session {} (no clients, not keep_alive)", .{session_id});
+        for (to_remove.items) |pty_id| {
+            if (self.ptys.getPtr(pty_id)) |pty_ptr| {
+                std.log.info("Killing PTY {} (no clients, not keep_alive)", .{pty_id});
                 // Signal PTY to stop and cancel I/O, but don't join thread yet
                 // Thread join happens in startServer defer block after event loop exits
                 pty_ptr.*.stopAndCancelIO(self.loop);
@@ -1586,8 +1629,8 @@ const Server = struct {
 
     fn removeClient(self: *Server, client: *Client) void {
         std.log.debug("Removing client fd={}", .{client.fd});
-        // Cleanup sessions (kill if no clients remain and not keep_alive)
-        self.cleanupSessionsForClient(client);
+        // Cleanup PTYs (kill if no clients remain and not keep_alive)
+        self.cleanupPtysForClient(client);
 
         // Free any queued sends
         for (client.send_queue.items) |buf| {

@@ -413,6 +413,7 @@ pub const App = struct {
     ui: UI = undefined,
     first_resize_done: bool = false,
     socket_path: []const u8 = undefined,
+    attach_session: ?[]const u8 = null,
     last_render_time: i64 = 0,
     render_timer: ?io.Task = null,
 
@@ -433,6 +434,10 @@ pub const App = struct {
     pipe_buf: std.ArrayList(u8),
     pipe_recv_buffer: [4096]u8 = undefined,
     colors: TerminalColors = .{},
+
+    pending_attach_ids: ?[]u32 = null,
+    pending_attach_count: usize = 0,
+    session_json: ?[]const u8 = null,
 
     pub const TerminalColors = struct {
         fg: ?vaxis.Cell.Color = null,
@@ -622,6 +627,49 @@ pub const App = struct {
                 };
             }
         }.redrawCb);
+
+        // Register detach callback
+        self.ui.setDetachCallback(self, struct {
+            fn detachCb(ctx: *anyopaque, session_name: []const u8) anyerror!void {
+                const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                try app_ptr.saveSession(session_name);
+
+                // Send detach_pty for each attached session to mark them keep_alive
+                var key_iter = app_ptr.surfaces.keyIterator();
+                while (key_iter.next()) |pty_id| {
+                    var params = try app_ptr.allocator.alloc(msgpack.Value, 2);
+                    params[0] = .{ .unsigned = pty_id.* };
+                    params[1] = .{ .unsigned = @intCast(app_ptr.fd) };
+
+                    var arr = try app_ptr.allocator.alloc(msgpack.Value, 3);
+                    arr[0] = .{ .unsigned = 2 }; // notification
+                    arr[1] = .{ .string = "detach_pty" };
+                    arr[2] = .{ .array = params };
+
+                    const encoded = msgpack.encodeFromValue(app_ptr.allocator, msgpack.Value{ .array = arr }) catch continue;
+                    defer app_ptr.allocator.free(encoded);
+                    app_ptr.allocator.free(arr);
+                    app_ptr.allocator.free(params);
+
+                    app_ptr.sendDirect(encoded) catch {};
+                }
+
+                // Same cleanup as quit
+                app_ptr.state.should_quit = true;
+                if (app_ptr.connected) {
+                    posix.close(app_ptr.fd);
+                    app_ptr.connected = false;
+                }
+                if (app_ptr.recv_task) |*task| {
+                    if (app_ptr.io_loop) |l| task.cancel(l) catch {};
+                    app_ptr.recv_task = null;
+                }
+                if (app_ptr.render_timer) |*task| {
+                    if (app_ptr.io_loop) |l| task.cancel(l) catch {};
+                    app_ptr.render_timer = null;
+                }
+            }
+        }.detachCb);
 
         // Manually trigger initial resize to connect
         const ws = try vaxis.Tty.getWinsize(self.tty.fd);
@@ -1252,29 +1300,35 @@ pub const App = struct {
                     // Vaxis and surface are already initialized from first winsize event
                     const ws = try vaxis.Tty.getWinsize(app.tty.fd);
 
-                    const msgid = app.state.next_msgid;
-                    app.state.next_msgid += 1;
-                    try app.state.pending_requests.put(msgid, .spawn);
+                    if (app.attach_session) |session_name| {
+                        // Attach mode: load session and attach to existing PTYs
+                        try app.startSessionAttach(session_name);
+                    } else {
+                        // Normal mode: spawn new PTY
+                        const msgid = app.state.next_msgid;
+                        app.state.next_msgid += 1;
+                        try app.state.pending_requests.put(msgid, .spawn);
 
-                    var params_kv = try app.allocator.alloc(msgpack.Value.KeyValue, 3);
-                    defer app.allocator.free(params_kv);
-                    std.log.info("Sending spawn_pty: rows={} cols={}", .{ ws.rows, ws.cols });
-                    params_kv[0] = .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = ws.rows } };
-                    params_kv[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = ws.cols } };
-                    params_kv[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = true } };
-                    const params_val = msgpack.Value{ .map = params_kv };
-                    var arr = try app.allocator.alloc(msgpack.Value, 4);
-                    defer app.allocator.free(arr);
-                    arr[0] = .{ .unsigned = 0 };
-                    arr[1] = .{ .unsigned = msgid };
-                    arr[2] = .{ .string = "spawn_pty" };
-                    arr[3] = params_val;
-                    app.send_buffer = try msgpack.encodeFromValue(app.allocator, msgpack.Value{ .array = arr });
+                        var params_kv = try app.allocator.alloc(msgpack.Value.KeyValue, 3);
+                        defer app.allocator.free(params_kv);
+                        std.log.info("Sending spawn_pty: rows={} cols={}", .{ ws.rows, ws.cols });
+                        params_kv[0] = .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = ws.rows } };
+                        params_kv[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = ws.cols } };
+                        params_kv[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = true } };
+                        const params_val = msgpack.Value{ .map = params_kv };
+                        var arr = try app.allocator.alloc(msgpack.Value, 4);
+                        defer app.allocator.free(arr);
+                        arr[0] = .{ .unsigned = 0 };
+                        arr[1] = .{ .unsigned = msgid };
+                        arr[2] = .{ .string = "spawn_pty" };
+                        arr[3] = params_val;
+                        app.send_buffer = try msgpack.encodeFromValue(app.allocator, msgpack.Value{ .array = arr });
 
-                    app.send_task = try l.send(fd, app.send_buffer.?, .{
-                        .ptr = app,
-                        .cb = onSendComplete,
-                    });
+                        app.send_task = try l.send(fd, app.send_buffer.?, .{
+                            .ptr = app,
+                            .cb = onSendComplete,
+                        });
+                    }
                 } else {
                     std.log.info("Connected but should_quit=true, not sending spawn_pty", .{});
                 }
@@ -1287,6 +1341,61 @@ pub const App = struct {
                 }
             },
             else => unreachable,
+        }
+    }
+
+    fn startSessionAttach(self: *App, session_name: []const u8) !void {
+        const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
+
+        const filename = try std.fmt.allocPrint(self.allocator, "{s}.json", .{session_name});
+        defer self.allocator.free(filename);
+
+        const path = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions", filename });
+        defer self.allocator.free(path);
+
+        const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+            std.log.err("Failed to open session file {s}: {}", .{ path, err });
+            return err;
+        };
+        defer file.close();
+
+        const json = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        self.session_json = json;
+
+        const pty_ids = try extractPtyIdsFromJson(self.allocator, json);
+        if (pty_ids.len == 0) {
+            std.log.err("No PTY IDs found in session", .{});
+            self.allocator.free(json);
+            self.session_json = null;
+            return error.NoSessionsFound;
+        }
+
+        std.log.info("Attaching to {} PTYs from session {s}", .{ pty_ids.len, session_name });
+        self.pending_attach_ids = pty_ids;
+        self.pending_attach_count = pty_ids.len;
+
+        for (pty_ids) |pty_id| {
+            const msgid = self.state.next_msgid;
+            self.state.next_msgid += 1;
+            try self.state.pending_requests.put(msgid, .{ .attach = @intCast(pty_id) });
+
+            // Server expects params as array: [pty_id]
+            var params = try self.allocator.alloc(msgpack.Value, 1);
+            params[0] = .{ .unsigned = pty_id };
+            const params_val = msgpack.Value{ .array = params };
+
+            var arr = try self.allocator.alloc(msgpack.Value, 4);
+            arr[0] = .{ .unsigned = 0 };
+            arr[1] = .{ .unsigned = msgid };
+            arr[2] = .{ .string = "attach_pty" };
+            arr[3] = params_val;
+
+            const encoded = try msgpack.encodeFromValue(self.allocator, msgpack.Value{ .array = arr });
+            defer self.allocator.free(encoded);
+            self.allocator.free(arr);
+            self.allocator.free(params);
+
+            try self.sendDirect(encoded);
         }
     }
 
@@ -1382,86 +1491,90 @@ pub const App = struct {
                                 }
 
                                 if (app.surfaces.get(pty_id)) |surface| {
-                                    std.log.info("Updating UI with pty_attach for {}", .{pty_id});
-                                    // Send pty_attach event to Lua UI
-                                    app.ui.update(.{
-                                        .pty_attach = .{
-                                            .id = pty_id,
-                                            .surface = surface,
-                                            .app = app,
-                                            .send_key_fn = struct {
-                                                fn appSendDirect(ctx: *anyopaque, id: u32, key: lua_event.KeyData) anyerror!void {
-                                                    const self: *App = @ptrCast(@alignCast(ctx));
+                                    // Skip pty_attach events during session restore - set_state will restore the UI tree
+                                    const is_session_restore = app.pending_attach_count > 0 or app.session_json != null;
+                                    if (!is_session_restore) {
+                                        std.log.info("Updating UI with pty_attach for {}", .{pty_id});
+                                        // Send pty_attach event to Lua UI
+                                        app.ui.update(.{
+                                            .pty_attach = .{
+                                                .id = pty_id,
+                                                .surface = surface,
+                                                .app = app,
+                                                .send_key_fn = struct {
+                                                    fn appSendDirect(ctx: *anyopaque, id: u32, key: lua_event.KeyData) anyerror!void {
+                                                        const self: *App = @ptrCast(@alignCast(ctx));
 
-                                                    var key_map_kv = try self.allocator.alloc(msgpack.Value.KeyValue, 6);
-                                                    key_map_kv[0] = .{ .key = .{ .string = "key" }, .value = .{ .string = key.key } };
-                                                    key_map_kv[1] = .{ .key = .{ .string = "code" }, .value = .{ .string = key.code } };
-                                                    key_map_kv[2] = .{ .key = .{ .string = "shiftKey" }, .value = .{ .boolean = key.shift } };
-                                                    key_map_kv[3] = .{ .key = .{ .string = "ctrlKey" }, .value = .{ .boolean = key.ctrl } };
-                                                    key_map_kv[4] = .{ .key = .{ .string = "altKey" }, .value = .{ .boolean = key.alt } };
-                                                    key_map_kv[5] = .{ .key = .{ .string = "metaKey" }, .value = .{ .boolean = key.super } };
+                                                        var key_map_kv = try self.allocator.alloc(msgpack.Value.KeyValue, 6);
+                                                        key_map_kv[0] = .{ .key = .{ .string = "key" }, .value = .{ .string = key.key } };
+                                                        key_map_kv[1] = .{ .key = .{ .string = "code" }, .value = .{ .string = key.code } };
+                                                        key_map_kv[2] = .{ .key = .{ .string = "shiftKey" }, .value = .{ .boolean = key.shift } };
+                                                        key_map_kv[3] = .{ .key = .{ .string = "ctrlKey" }, .value = .{ .boolean = key.ctrl } };
+                                                        key_map_kv[4] = .{ .key = .{ .string = "altKey" }, .value = .{ .boolean = key.alt } };
+                                                        key_map_kv[5] = .{ .key = .{ .string = "metaKey" }, .value = .{ .boolean = key.super } };
 
-                                                    const key_map_val = msgpack.Value{ .map = key_map_kv };
+                                                        const key_map_val = msgpack.Value{ .map = key_map_kv };
 
-                                                    var params = try self.allocator.alloc(msgpack.Value, 2);
-                                                    params[0] = .{ .unsigned = @intCast(id) };
-                                                    params[1] = key_map_val;
+                                                        var params = try self.allocator.alloc(msgpack.Value, 2);
+                                                        params[0] = .{ .unsigned = @intCast(id) };
+                                                        params[1] = key_map_val;
 
-                                                    var arr = try self.allocator.alloc(msgpack.Value, 3);
-                                                    arr[0] = .{ .unsigned = 2 }; // notification
-                                                    arr[1] = .{ .string = "key_input" };
-                                                    arr[2] = .{ .array = params };
+                                                        var arr = try self.allocator.alloc(msgpack.Value, 3);
+                                                        arr[0] = .{ .unsigned = 2 }; // notification
+                                                        arr[1] = .{ .string = "key_input" };
+                                                        arr[2] = .{ .array = params };
 
-                                                    const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
-                                                    defer self.allocator.free(encoded_msg);
+                                                        const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
+                                                        defer self.allocator.free(encoded_msg);
 
-                                                    // Clean up msgpack structures
-                                                    self.allocator.free(arr);
-                                                    self.allocator.free(params);
-                                                    self.allocator.free(key_map_kv);
+                                                        // Clean up msgpack structures
+                                                        self.allocator.free(arr);
+                                                        self.allocator.free(params);
+                                                        self.allocator.free(key_map_kv);
 
-                                                    try self.sendDirect(encoded_msg);
-                                                }
-                                            }.appSendDirect,
-                                            .send_mouse_fn = struct {
-                                                fn appSendMouse(ctx: *anyopaque, id: u32, mouse: lua_event.MouseData) anyerror!void {
-                                                    const self: *App = @ptrCast(@alignCast(ctx));
+                                                        try self.sendDirect(encoded_msg);
+                                                    }
+                                                }.appSendDirect,
+                                                .send_mouse_fn = struct {
+                                                    fn appSendMouse(ctx: *anyopaque, id: u32, mouse: lua_event.MouseData) anyerror!void {
+                                                        const self: *App = @ptrCast(@alignCast(ctx));
 
-                                                    var mouse_map_kv = try self.allocator.alloc(msgpack.Value.KeyValue, 7);
-                                                    mouse_map_kv[0] = .{ .key = .{ .string = "x" }, .value = .{ .float = mouse.x } };
-                                                    mouse_map_kv[1] = .{ .key = .{ .string = "y" }, .value = .{ .float = mouse.y } };
-                                                    mouse_map_kv[2] = .{ .key = .{ .string = "button" }, .value = .{ .string = mouse.button } };
-                                                    mouse_map_kv[3] = .{ .key = .{ .string = "event_type" }, .value = .{ .string = mouse.event_type } };
-                                                    mouse_map_kv[4] = .{ .key = .{ .string = "shiftKey" }, .value = .{ .boolean = mouse.shift } };
-                                                    mouse_map_kv[5] = .{ .key = .{ .string = "ctrlKey" }, .value = .{ .boolean = mouse.ctrl } };
-                                                    mouse_map_kv[6] = .{ .key = .{ .string = "altKey" }, .value = .{ .boolean = mouse.alt } };
+                                                        var mouse_map_kv = try self.allocator.alloc(msgpack.Value.KeyValue, 7);
+                                                        mouse_map_kv[0] = .{ .key = .{ .string = "x" }, .value = .{ .float = mouse.x } };
+                                                        mouse_map_kv[1] = .{ .key = .{ .string = "y" }, .value = .{ .float = mouse.y } };
+                                                        mouse_map_kv[2] = .{ .key = .{ .string = "button" }, .value = .{ .string = mouse.button } };
+                                                        mouse_map_kv[3] = .{ .key = .{ .string = "event_type" }, .value = .{ .string = mouse.event_type } };
+                                                        mouse_map_kv[4] = .{ .key = .{ .string = "shiftKey" }, .value = .{ .boolean = mouse.shift } };
+                                                        mouse_map_kv[5] = .{ .key = .{ .string = "ctrlKey" }, .value = .{ .boolean = mouse.ctrl } };
+                                                        mouse_map_kv[6] = .{ .key = .{ .string = "altKey" }, .value = .{ .boolean = mouse.alt } };
 
-                                                    const mouse_map_val = msgpack.Value{ .map = mouse_map_kv };
+                                                        const mouse_map_val = msgpack.Value{ .map = mouse_map_kv };
 
-                                                    var params = try self.allocator.alloc(msgpack.Value, 2);
-                                                    params[0] = .{ .unsigned = @intCast(id) };
-                                                    params[1] = mouse_map_val;
+                                                        var params = try self.allocator.alloc(msgpack.Value, 2);
+                                                        params[0] = .{ .unsigned = @intCast(id) };
+                                                        params[1] = mouse_map_val;
 
-                                                    var arr = try self.allocator.alloc(msgpack.Value, 3);
-                                                    arr[0] = .{ .unsigned = 2 }; // notification
-                                                    arr[1] = .{ .string = "mouse_input" };
-                                                    arr[2] = .{ .array = params };
+                                                        var arr = try self.allocator.alloc(msgpack.Value, 3);
+                                                        arr[0] = .{ .unsigned = 2 }; // notification
+                                                        arr[1] = .{ .string = "mouse_input" };
+                                                        arr[2] = .{ .array = params };
 
-                                                    const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
-                                                    defer self.allocator.free(encoded_msg);
+                                                        const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
+                                                        defer self.allocator.free(encoded_msg);
 
-                                                    // Clean up msgpack structures
-                                                    self.allocator.free(arr);
-                                                    self.allocator.free(params);
-                                                    self.allocator.free(mouse_map_kv);
+                                                        // Clean up msgpack structures
+                                                        self.allocator.free(arr);
+                                                        self.allocator.free(params);
+                                                        self.allocator.free(mouse_map_kv);
 
-                                                    try self.sendDirect(encoded_msg);
-                                                }
-                                            }.appSendMouse,
-                                        },
-                                    }) catch |err| {
-                                        std.log.err("Failed to update UI with pty_attach: {}", .{err});
-                                    };
+                                                        try self.sendDirect(encoded_msg);
+                                                    }
+                                                }.appSendMouse,
+                                            },
+                                        }) catch |err| {
+                                            std.log.err("Failed to update UI with pty_attach: {}", .{err});
+                                        };
+                                    }
 
                                     const width_px = @as(u16, surface.cols) * app.cell_width_px;
                                     const height_px = @as(u16, surface.rows) * app.cell_height_px;
@@ -1473,6 +1586,26 @@ pub const App = struct {
                                     });
                                     defer app.allocator.free(resize_msg);
                                     try app.sendDirect(resize_msg);
+
+                                    // Check if we're in session attach mode and all PTYs attached
+                                    if (app.pending_attach_count > 0) {
+                                        app.pending_attach_count -= 1;
+                                        if (app.pending_attach_count == 0) {
+                                            std.log.info("All PTYs attached, restoring session state", .{});
+                                            if (app.session_json) |json| {
+                                                app.ui.setStateFromJson(json, ptyLookup, app) catch |err| {
+                                                    std.log.err("Failed to restore session state: {}", .{err});
+                                                };
+                                                app.allocator.free(json);
+                                                app.session_json = null;
+                                            }
+                                            if (app.pending_attach_ids) |ids| {
+                                                app.allocator.free(ids);
+                                                app.pending_attach_ids = null;
+                                            }
+                                            try app.scheduleRender();
+                                        }
+                                    }
                                 }
                             },
                             .pty_exited => |info| {
@@ -1548,6 +1681,178 @@ pub const App = struct {
         defer self.allocator.free(msg);
 
         try self.sendDirect(msg);
+    }
+
+    pub fn saveSession(self: *App, name: []const u8) !void {
+        const json = try self.ui.getStateJson();
+        defer self.allocator.free(json);
+
+        const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
+        const state_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions" });
+        defer self.allocator.free(state_dir);
+
+        std.fs.makeDirAbsolute(state_dir) catch |err| {
+            if (err != error.PathAlreadyExists) {
+                // Try creating parent directories
+                const parent = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise" });
+                defer self.allocator.free(parent);
+                std.fs.makeDirAbsolute(parent) catch |e| {
+                    if (e != error.PathAlreadyExists) return e;
+                };
+                std.fs.makeDirAbsolute(state_dir) catch |e| {
+                    if (e != error.PathAlreadyExists) return e;
+                };
+            }
+        };
+
+        const filename = try std.fmt.allocPrint(self.allocator, "{s}.json", .{name});
+        defer self.allocator.free(filename);
+
+        const path = try std.fs.path.join(self.allocator, &.{ state_dir, filename });
+        defer self.allocator.free(path);
+
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+
+        try file.writeAll(json);
+        std.log.info("Session saved to {s}", .{path});
+    }
+
+    pub fn loadSession(self: *App, name: []const u8) !void {
+        const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
+
+        const filename = try std.fmt.allocPrint(self.allocator, "{s}.json", .{name});
+        defer self.allocator.free(filename);
+
+        const path = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions", filename });
+        defer self.allocator.free(path);
+
+        const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+            std.log.err("Failed to open session file {s}: {}", .{ path, err });
+            return err;
+        };
+        defer file.close();
+
+        const json = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        defer self.allocator.free(json);
+
+        try self.ui.setStateFromJson(json, ptyLookup, self);
+        std.log.info("Session loaded from {s}", .{path});
+    }
+
+    fn extractPtyIdsFromJson(allocator: std.mem.Allocator, json: []const u8) ![]u32 {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer parsed.deinit();
+
+        var ids: std.ArrayList(u32) = .empty;
+        errdefer ids.deinit(allocator);
+
+        try collectPtyIds(&ids, allocator, parsed.value);
+        return ids.toOwnedSlice(allocator);
+    }
+
+    fn collectPtyIds(ids: *std.ArrayList(u32), allocator: std.mem.Allocator, value: std.json.Value) !void {
+        switch (value) {
+            .object => |obj| {
+                if (obj.get("type")) |type_val| {
+                    if (type_val == .string and std.mem.eql(u8, type_val.string, "pane")) {
+                        if (obj.get("pty_id")) |pty_id_val| {
+                            if (pty_id_val == .integer) {
+                                try ids.append(allocator, @intCast(pty_id_val.integer));
+                            }
+                        }
+                    }
+                }
+                var it = obj.iterator();
+                while (it.next()) |entry| {
+                    try collectPtyIds(ids, allocator, entry.value_ptr.*);
+                }
+            },
+            .array => |arr| {
+                for (arr.items) |item| {
+                    try collectPtyIds(ids, allocator, item);
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn ptyLookup(ctx: *anyopaque, id: u32) ?UI.PtyLookupResult {
+        const self: *App = @ptrCast(@alignCast(ctx));
+
+        const surface = self.surfaces.get(id) orelse return null;
+
+        return .{
+            .surface = surface,
+            .app = self,
+            .send_key_fn = struct {
+                fn sendKey(app_ctx: *anyopaque, pty_id: u32, key: lua_event.KeyData) anyerror!void {
+                    const app: *App = @ptrCast(@alignCast(app_ctx));
+
+                    var key_map_kv = try app.allocator.alloc(msgpack.Value.KeyValue, 6);
+                    key_map_kv[0] = .{ .key = .{ .string = "key" }, .value = .{ .string = key.key } };
+                    key_map_kv[1] = .{ .key = .{ .string = "code" }, .value = .{ .string = key.code } };
+                    key_map_kv[2] = .{ .key = .{ .string = "shiftKey" }, .value = .{ .boolean = key.shift } };
+                    key_map_kv[3] = .{ .key = .{ .string = "ctrlKey" }, .value = .{ .boolean = key.ctrl } };
+                    key_map_kv[4] = .{ .key = .{ .string = "altKey" }, .value = .{ .boolean = key.alt } };
+                    key_map_kv[5] = .{ .key = .{ .string = "metaKey" }, .value = .{ .boolean = key.super } };
+
+                    const key_map_val = msgpack.Value{ .map = key_map_kv };
+
+                    var params = try app.allocator.alloc(msgpack.Value, 2);
+                    params[0] = .{ .unsigned = @intCast(pty_id) };
+                    params[1] = key_map_val;
+
+                    var arr = try app.allocator.alloc(msgpack.Value, 3);
+                    arr[0] = .{ .unsigned = 2 };
+                    arr[1] = .{ .string = "key_input" };
+                    arr[2] = .{ .array = params };
+
+                    const encoded_msg = try msgpack.encodeFromValue(app.allocator, .{ .array = arr });
+                    defer app.allocator.free(encoded_msg);
+
+                    app.allocator.free(arr);
+                    app.allocator.free(params);
+                    app.allocator.free(key_map_kv);
+
+                    try app.sendDirect(encoded_msg);
+                }
+            }.sendKey,
+            .send_mouse_fn = struct {
+                fn sendMouse(app_ctx: *anyopaque, pty_id: u32, mouse: lua_event.MouseData) anyerror!void {
+                    const app: *App = @ptrCast(@alignCast(app_ctx));
+
+                    var mouse_map_kv = try app.allocator.alloc(msgpack.Value.KeyValue, 7);
+                    mouse_map_kv[0] = .{ .key = .{ .string = "x" }, .value = .{ .float = mouse.x } };
+                    mouse_map_kv[1] = .{ .key = .{ .string = "y" }, .value = .{ .float = mouse.y } };
+                    mouse_map_kv[2] = .{ .key = .{ .string = "button" }, .value = .{ .string = mouse.button } };
+                    mouse_map_kv[3] = .{ .key = .{ .string = "event_type" }, .value = .{ .string = mouse.event_type } };
+                    mouse_map_kv[4] = .{ .key = .{ .string = "shiftKey" }, .value = .{ .boolean = mouse.shift } };
+                    mouse_map_kv[5] = .{ .key = .{ .string = "ctrlKey" }, .value = .{ .boolean = mouse.ctrl } };
+                    mouse_map_kv[6] = .{ .key = .{ .string = "altKey" }, .value = .{ .boolean = mouse.alt } };
+
+                    const mouse_map_val = msgpack.Value{ .map = mouse_map_kv };
+
+                    var params = try app.allocator.alloc(msgpack.Value, 2);
+                    params[0] = .{ .unsigned = @intCast(pty_id) };
+                    params[1] = mouse_map_val;
+
+                    var arr = try app.allocator.alloc(msgpack.Value, 3);
+                    arr[0] = .{ .unsigned = 2 };
+                    arr[1] = .{ .string = "mouse_input" };
+                    arr[2] = .{ .array = params };
+
+                    const encoded_msg = try msgpack.encodeFromValue(app.allocator, .{ .array = arr });
+                    defer app.allocator.free(encoded_msg);
+
+                    app.allocator.free(arr);
+                    app.allocator.free(params);
+                    app.allocator.free(mouse_map_kv);
+
+                    try app.sendDirect(encoded_msg);
+                }
+            }.sendMouse,
+        };
     }
 };
 

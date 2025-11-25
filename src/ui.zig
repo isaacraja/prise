@@ -5,6 +5,7 @@ const widget = @import("widget.zig");
 const lua_event = @import("lua_event.zig");
 const io = @import("io.zig");
 const msgpack = @import("msgpack.zig");
+const Surface = @import("Surface.zig");
 
 const logger = std.log.scoped(.lua);
 
@@ -66,6 +67,8 @@ pub const UI = struct {
     spawn_ctx: *anyopaque = undefined,
     redraw_callback: ?*const fn (ctx: *anyopaque) void = null,
     redraw_ctx: *anyopaque = undefined,
+    detach_callback: ?*const fn (ctx: *anyopaque, session_name: []const u8) anyerror!void = null,
+    detach_ctx: *anyopaque = undefined,
 
     pub const SpawnOptions = struct {
         rows: u16,
@@ -153,6 +156,11 @@ pub const UI = struct {
         self.redraw_callback = cb;
     }
 
+    pub fn setDetachCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, session_name: []const u8) anyerror!void) void {
+        self.detach_ctx = ctx;
+        self.detach_callback = cb;
+    }
+
     fn loadPriseModule(lua: *ziglua.Lua) i32 {
         lua.doString(prise_module) catch {
             lua.pushNil();
@@ -174,6 +182,10 @@ pub const UI = struct {
         // Register request_frame
         lua.pushFunction(ziglua.wrap(requestFrame));
         lua.setField(-2, "request_frame");
+
+        // Register detach
+        lua.pushFunction(ziglua.wrap(detach));
+        lua.setField(-2, "detach");
 
         // Register log
         lua.createTable(0, 4);
@@ -249,6 +261,26 @@ pub const UI = struct {
 
         if (ui.redraw_callback) |cb| {
             cb(ui.redraw_ctx);
+        }
+        return 0;
+    }
+
+    fn detach(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui = lua.toUserdata(UI, -1) catch {
+            lua.pushNil();
+            return 1;
+        };
+        lua.pop(1);
+
+        const session_name = lua.toString(1) catch "default";
+
+        if (ui.detach_callback) |cb| {
+            cb(ui.detach_ctx, session_name) catch |err| {
+                lua.raiseErrorStr("Failed to detach: %s", .{@errorName(err).ptr});
+            };
+        } else {
+            lua.raiseErrorStr("Detach callback not configured", .{});
         }
         return 0;
     }
@@ -422,4 +454,201 @@ pub const UI = struct {
 
         return widget.parseWidget(self.lua, self.allocator, -1);
     }
+
+    pub fn getStateJson(self: *UI) ![]u8 {
+        _ = self.lua.getField(ziglua.registry_index, "prise_ui");
+        defer self.lua.pop(1);
+
+        _ = self.lua.getField(-1, "get_state");
+        if (self.lua.typeOf(-1) != .function) {
+            return error.NoGetStateFunction;
+        }
+
+        self.lua.protectedCall(.{ .args = 0, .results = 1, .msg_handler = 0 }) catch |err| {
+            const msg = self.lua.toString(-1) catch "Unknown Lua error";
+            std.log.err("Lua get_state error: {s}", .{msg});
+            self.lua.pop(1);
+            return err;
+        };
+        defer self.lua.pop(1);
+
+        return luaTableToJson(self.lua, self.allocator, -1);
+    }
+
+    pub const PtyLookupResult = struct {
+        surface: *Surface,
+        app: *anyopaque,
+        send_key_fn: *const fn (app: *anyopaque, id: u32, key: lua_event.KeyData) anyerror!void,
+        send_mouse_fn: *const fn (app: *anyopaque, id: u32, mouse: lua_event.MouseData) anyerror!void,
+    };
+
+    pub const PtyLookupFn = *const fn (ctx: *anyopaque, id: u32) ?PtyLookupResult;
+
+    pub fn setStateFromJson(self: *UI, json: []const u8, pty_lookup_fn: PtyLookupFn, pty_lookup_ctx: *anyopaque) !void {
+        _ = self.lua.getField(ziglua.registry_index, "prise_ui");
+        defer self.lua.pop(1);
+
+        _ = self.lua.getField(-1, "set_state");
+        if (self.lua.typeOf(-1) != .function) {
+            return error.NoSetStateFunction;
+        }
+
+        try jsonToLuaTable(self.lua, self.allocator, json);
+
+        // Create pty_lookup closure with context
+        const LookupCtx = struct {
+            ctx: *anyopaque,
+            lookup_fn: PtyLookupFn,
+        };
+        const lookup_ctx = try self.allocator.create(LookupCtx);
+        lookup_ctx.* = .{ .ctx = pty_lookup_ctx, .lookup_fn = pty_lookup_fn };
+
+        self.lua.pushLightUserdata(lookup_ctx);
+        self.lua.pushClosure(ziglua.wrap(ptyLookupWrapper), 1);
+
+        self.lua.protectedCall(.{ .args = 2, .results = 0, .msg_handler = 0 }) catch |err| {
+            const msg = self.lua.toString(-1) catch "Unknown Lua error";
+            std.log.err("Lua set_state error: {s}", .{msg});
+            self.lua.pop(1);
+            self.allocator.destroy(lookup_ctx);
+            return err;
+        };
+
+        self.allocator.destroy(lookup_ctx);
+    }
+
+    fn ptyLookupWrapper(lua: *ziglua.Lua) i32 {
+        const LookupCtx = struct {
+            ctx: *anyopaque,
+            lookup_fn: PtyLookupFn,
+        };
+        const lookup_ctx = lua.toUserdata(LookupCtx, ziglua.Lua.upvalueIndex(1)) catch return 0;
+
+        const id: u32 = @intCast(lua.checkInteger(1));
+        const result = lookup_ctx.lookup_fn(lookup_ctx.ctx, id);
+
+        if (result) |r| {
+            lua_event.pushPtyUserdata(lua, id, r.surface, r.app, r.send_key_fn, r.send_mouse_fn) catch {
+                lua.pushNil();
+            };
+        } else {
+            lua.pushNil();
+        }
+        return 1;
+    }
 };
+
+fn luaTableToJson(lua: *ziglua.Lua, allocator: std.mem.Allocator, index: i32) ![]u8 {
+    const value = try luaToJsonValue(lua, allocator, index);
+
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(allocator);
+
+    try list.writer(allocator).print("{f}", .{std.json.fmt(value, .{ .whitespace = .indent_2 })});
+    return list.toOwnedSlice(allocator);
+}
+
+fn luaToJsonValue(lua: *ziglua.Lua, allocator: std.mem.Allocator, index: i32) !std.json.Value {
+    const abs_index = if (index < 0) @as(i32, @intCast(lua.getTop())) + index + 1 else index;
+
+    return switch (lua.typeOf(abs_index)) {
+        .nil => .null,
+        .boolean => .{ .bool = lua.toBoolean(abs_index) },
+        .number => blk: {
+            if (lua.isInteger(abs_index)) {
+                break :blk .{ .integer = lua.toInteger(abs_index) catch 0 };
+            } else {
+                break :blk .{ .float = lua.toNumber(abs_index) catch 0 };
+            }
+        },
+        .string => .{ .string = try allocator.dupe(u8, lua.toString(abs_index) catch "") },
+        .table => blk: {
+            // Check if array or object by looking for integer keys starting at 1
+            var is_array = true;
+            var max_index: i64 = 0;
+
+            lua.pushNil();
+            while (lua.next(abs_index)) {
+                lua.pop(1); // pop value, keep key
+                if (lua.typeOf(-1) == .number and lua.isInteger(-1)) {
+                    const key = lua.toInteger(-1) catch 0;
+                    if (key > 0) {
+                        if (key > max_index) max_index = key;
+                    } else {
+                        is_array = false;
+                        lua.pop(1);
+                        break;
+                    }
+                } else {
+                    is_array = false;
+                    lua.pop(1);
+                    break;
+                }
+            }
+
+            if (is_array and max_index > 0) {
+                var arr = std.json.Array.init(allocator);
+                errdefer arr.deinit();
+
+                for (1..@intCast(max_index + 1)) |i| {
+                    _ = lua.rawGetIndex(abs_index, @intCast(i));
+                    const val = try luaToJsonValue(lua, allocator, -1);
+                    lua.pop(1);
+                    try arr.append(val);
+                }
+                break :blk .{ .array = arr };
+            } else {
+                var obj = std.json.ObjectMap.init(allocator);
+                errdefer obj.deinit();
+
+                lua.pushNil();
+                while (lua.next(abs_index)) {
+                    const val = try luaToJsonValue(lua, allocator, -1);
+                    lua.pop(1);
+
+                    const key = lua.toString(-1) catch {
+                        continue;
+                    };
+                    const key_owned = try allocator.dupe(u8, key);
+                    try obj.put(key_owned, val);
+                }
+                break :blk .{ .object = obj };
+            }
+        },
+        else => .null,
+    };
+}
+
+fn jsonToLuaTable(lua: *ziglua.Lua, allocator: std.mem.Allocator, json: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try pushJsonValue(lua, parsed.value);
+}
+
+fn pushJsonValue(lua: *ziglua.Lua, value: std.json.Value) !void {
+    switch (value) {
+        .null => lua.pushNil(),
+        .bool => |b| lua.pushBoolean(b),
+        .integer => |i| lua.pushInteger(i),
+        .float => |f| lua.pushNumber(f),
+        .string => |s| _ = lua.pushString(s),
+        .array => |arr| {
+            lua.createTable(@intCast(arr.items.len), 0);
+            for (arr.items, 1..) |item, i| {
+                try pushJsonValue(lua, item);
+                lua.rawSetIndex(-2, @intCast(i));
+            }
+        },
+        .object => |obj| {
+            lua.createTable(0, @intCast(obj.count()));
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                _ = lua.pushString(entry.key_ptr.*);
+                try pushJsonValue(lua, entry.value_ptr.*);
+                lua.setTable(-3);
+            }
+        },
+        .number_string => |s| _ = lua.pushString(s),
+    }
+}
