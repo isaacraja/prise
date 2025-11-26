@@ -95,7 +95,8 @@ const Pty = struct {
         _ = posix.write(self.exit_pipe_fds[1], "q") catch {};
 
         // Kill the PTY process
-        _ = posix.kill(self.process.pid, posix.SIG.HUP) catch {};
+        // Try SIGTERM first, then SIGKILL if that doesn't work
+        _ = posix.kill(self.process.pid, posix.SIG.TERM) catch {};
 
         // Cancel any pending render timer
         if (self.render_timer) |*task| {
@@ -112,6 +113,15 @@ const Pty = struct {
         if (self.read_thread) |thread| {
             thread.join();
         }
+
+        // If the process is still running (thread was killed before it could reap),
+        // ensure we terminate it with SIGKILL before cleanup
+        if (!self.exited.load(.acquire)) {
+            _ = posix.kill(self.process.pid, posix.SIG.KILL) catch {};
+            // Give it a moment to die
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+
         self.process.close();
 
         posix.close(self.pipe_fds[0]);
