@@ -36,9 +36,33 @@ const foo = Type{ .field = value };     // Avoid
 
 **Memory:** Pass allocators explicitly, use `errdefer` for cleanup on error
 
-**Documentation:** Use `///` for public API, `//` for implementation notes
+**Documentation:** Use `///` for public API, `//` for implementation notes. Always explain *why*, not just *what*.
 
 **Tests:** Inline in the same file, register in src/main.zig test block
+
+## Safety Conventions
+
+Inspired by [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
+
+**Assertions:**
+- Target minimum 2 assertions per function for public APIs
+- Assert preconditions (valid state, non-null pointers, bounds)
+- Assert postconditions (result validity, state changes)
+- Pair assertions: check the same property at write and read points
+
+**Limits:**
+- Put explicit bounds on all collections and resources
+- Define limits as named constants, not magic numbers
+- Assert limits are respected before operations
+
+**Function size:**
+- Hard limit of 70 lines per function
+- Centralize control flow (switch/if) in parent functions
+- Push pure computation to helper functions
+
+**Comments:**
+- Explain *why* the code exists, not *what* it does
+- Document non-obvious thresholds, timing values, protocol details
 
 ## Lua Code Style
 

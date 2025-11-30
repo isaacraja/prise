@@ -18,6 +18,15 @@ const posix = std.posix;
 
 const log = std.log.scoped(.server);
 
+/// Resource limits to prevent unbounded growth in the long-running daemon.
+pub const LIMITS = struct {
+    pub const CLIENTS_MAX: usize = 64;
+    pub const PTYS_MAX: usize = 256;
+    pub const MESSAGE_SIZE_MAX: usize = 16 * 1024 * 1024; // 16MB
+    pub const SEND_QUEUE_MAX: usize = 1024;
+    pub const TITLE_LEN_MAX: usize = 4096;
+};
+
 var signal_write_fd: posix.fd_t = undefined;
 
 fn signalHandler(sig: c_int) callconv(std.builtin.CallingConvention.c) void {
@@ -179,9 +188,12 @@ const Pty = struct {
     fn setTitle(self: *Pty, title: []const u8) !void {
         // Mutex is already held by readThread when this is called via callback
 
+        // Truncate title to prevent unbounded growth
+        const truncated = if (title.len > LIMITS.TITLE_LEN_MAX) title[0..LIMITS.TITLE_LEN_MAX] else title;
+
         // Update internal title
         self.title.clearRetainingCapacity();
-        try self.title.appendSlice(self.allocator, title);
+        try self.title.appendSlice(self.allocator, truncated);
         self.title_dirty = true;
     }
 
@@ -671,10 +683,18 @@ const Client = struct {
 
     fn sendData(self: *Client, loop: *io.Loop, data: []const u8) !void {
         if (self.closing) return;
+
+        std.debug.assert(data.len <= LIMITS.MESSAGE_SIZE_MAX);
+
         const buf = try self.server.allocator.dupe(u8, data);
+        errdefer self.server.allocator.free(buf);
 
         // If there's a pending send, queue this one
         if (self.send_buffer != null) {
+            if (self.send_queue.items.len >= LIMITS.SEND_QUEUE_MAX) {
+                self.server.allocator.free(buf);
+                return error.SendQueueFull;
+            }
             try self.send_queue.append(self.server.allocator, buf);
             return;
         }
@@ -1427,6 +1447,11 @@ const Server = struct {
         if (std.mem.eql(u8, method, "ping")) {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "pong") };
         } else if (std.mem.eql(u8, method, "spawn_pty")) {
+            if (self.ptys.count() >= LIMITS.PTYS_MAX) {
+                log.warn("PTY limit reached ({})", .{LIMITS.PTYS_MAX});
+                return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY limit reached") };
+            }
+
             const parsed = parseSpawnPtyParams(params);
             log.info("spawn_pty: rows={} cols={} attach={}", .{ parsed.size.ws_row, parsed.size.ws_col, parsed.attach });
 
@@ -1454,6 +1479,7 @@ const Server = struct {
             pty_instance.server_ptr = self;
 
             try self.ptys.put(pty_id, pty_instance);
+            std.debug.assert(self.ptys.count() <= LIMITS.PTYS_MAX);
 
             pty_instance.read_thread = try std.Thread.spawn(.{}, Pty.readThread, .{ pty_instance, self });
 
@@ -1810,6 +1836,25 @@ const Server = struct {
         switch (completion.result) {
             .accept => |client_fd| {
                 std.log.debug("Accepted client connection fd={}", .{client_fd});
+
+                if (self.clients.items.len >= LIMITS.CLIENTS_MAX) {
+                    std.log.warn("Client limit reached ({}), rejecting connection", .{LIMITS.CLIENTS_MAX});
+                    _ = try loop.close(client_fd, .{
+                        .ptr = null,
+                        .cb = struct {
+                            fn noop(_: *io.Loop, _: io.Completion) anyerror!void {}
+                        }.noop,
+                    });
+                    // Queue next accept if still accepting
+                    if (self.accepting) {
+                        self.accept_task = try loop.accept(self.listen_fd, .{
+                            .ptr = self,
+                            .cb = onAccept,
+                        });
+                    }
+                    return;
+                }
+
                 const client = try self.allocator.create(Client);
                 client.* = .{
                     .fd = client_fd,
@@ -1820,6 +1865,7 @@ const Server = struct {
                     // .style_cache = std.AutoHashMap(u16, redraw.UIEvent.Style.Attributes).init(self.allocator),
                 };
                 try self.clients.append(self.allocator, client);
+                std.debug.assert(self.clients.items.len <= LIMITS.CLIENTS_MAX);
                 std.log.debug("Total clients: {}", .{self.clients.items.len});
 
                 // Start recv to detect disconnect
