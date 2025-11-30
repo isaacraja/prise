@@ -1933,15 +1933,6 @@ const Server = struct {
             }
         }
 
-        // Also cleanup any orphaned PTYs with no clients and not keep_alive
-        var it = self.ptys.iterator();
-        while (it.next()) |entry| {
-            const pty_instance = entry.value_ptr.*;
-            if (pty_instance.clients.items.len == 0 and !pty_instance.keep_alive) {
-                to_remove.append(self.allocator, pty_instance.id) catch {};
-            }
-        }
-
         for (to_remove.items) |pty_id| {
             if (self.ptys.getPtr(pty_id)) |pty_ptr| {
                 std.log.info("Killing PTY {} (no clients, not keep_alive)", .{pty_id});
