@@ -872,8 +872,8 @@ function M.update(event)
             return
         end
 
-        -- Super+k or Ctrl+k to enter command mode
-        if event.data.key == "k" and (event.data.super or event.data.ctrl) then
+        -- Super+k to enter command mode
+        if event.data.key == "k" and event.data.super then
             state.pending_command = true
             prise.request_frame()
             state.timer = prise.set_timeout(1000, function()
