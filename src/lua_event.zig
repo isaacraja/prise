@@ -23,6 +23,7 @@ pub const Event = union(enum) {
         send_key_fn: *const fn (app: *anyopaque, id: u32, key: KeyData) anyerror!void,
         send_mouse_fn: *const fn (app: *anyopaque, id: u32, mouse: MouseData) anyerror!void,
         send_paste_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
+        set_focus_fn: *const fn (app: *anyopaque, id: u32, focused: bool) anyerror!void,
         close_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
     },
     pty_exited: struct {
@@ -101,6 +102,7 @@ pub fn pushEvent(lua: *ziglua.Lua, event: Event) !void {
                 .send_key_fn = info.send_key_fn,
                 .send_mouse_fn = info.send_mouse_fn,
                 .send_paste_fn = info.send_paste_fn,
+                .set_focus_fn = info.set_focus_fn,
                 .close_fn = info.close_fn,
             };
 
@@ -310,6 +312,16 @@ pub fn pushEvent(lua: *ziglua.Lua, event: Event) !void {
                 lua.setField(-2, "data");
             },
 
+            .focus_in => {
+                _ = lua.pushString("focus_in");
+                lua.setField(-2, "type");
+            },
+
+            .focus_out => {
+                _ = lua.pushString("focus_out");
+                lua.setField(-2, "type");
+            },
+
             else => {
                 _ = lua.pushString("unknown");
                 lua.setField(-2, "type");
@@ -325,6 +337,7 @@ const PtyHandle = struct {
     send_key_fn: *const fn (app: *anyopaque, id: u32, key: KeyData) anyerror!void,
     send_mouse_fn: *const fn (app: *anyopaque, id: u32, mouse: MouseData) anyerror!void,
     send_paste_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
+    set_focus_fn: *const fn (app: *anyopaque, id: u32, focused: bool) anyerror!void,
     close_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
 };
 
@@ -348,6 +361,10 @@ fn ptyIndex(lua: *ziglua.Lua) i32 {
     }
     if (std.mem.eql(u8, key, "send_paste")) {
         lua.pushFunction(ziglua.wrap(ptySendPaste));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "set_focus")) {
+        lua.pushFunction(ziglua.wrap(ptySetFocus));
         return 1;
     }
     if (std.mem.eql(u8, key, "close")) {
@@ -495,6 +512,15 @@ fn ptySendPaste(lua: *ziglua.Lua) i32 {
     return 0;
 }
 
+fn ptySetFocus(lua: *ziglua.Lua) i32 {
+    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const focused = lua.toBoolean(2);
+    pty.set_focus_fn(pty.app, pty.id, focused) catch |err| {
+        lua.raiseErrorStr("Failed to set focus: %s", .{@errorName(err).ptr});
+    };
+    return 0;
+}
+
 fn ptyClose(lua: *ziglua.Lua) i32 {
     const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
     pty.close_fn(pty.app, pty.id) catch |err| {
@@ -602,6 +628,7 @@ pub fn pushPtyUserdata(
     send_key_fn: *const fn (app: *anyopaque, id: u32, key: KeyData) anyerror!void,
     send_mouse_fn: *const fn (app: *anyopaque, id: u32, mouse: MouseData) anyerror!void,
     send_paste_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
+    set_focus_fn: *const fn (app: *anyopaque, id: u32, focused: bool) anyerror!void,
     close_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
 ) !void {
     const pty = lua.newUserdata(PtyHandle, @sizeOf(PtyHandle));
@@ -612,6 +639,7 @@ pub fn pushPtyUserdata(
         .send_key_fn = send_key_fn,
         .send_mouse_fn = send_mouse_fn,
         .send_paste_fn = send_paste_fn,
+        .set_focus_fn = set_focus_fn,
         .close_fn = close_fn,
     };
 

@@ -1493,6 +1493,42 @@ const Client = struct {
                     } else {
                         log.warn("detach_pty notification: invalid params", .{});
                     }
+                } else if (std.mem.eql(u8, notif.method, "focus_event")) {
+                    if (notif.params == .array and notif.params.array.len >= 2) {
+                        const pty_id: usize = switch (notif.params.array[0]) {
+                            .unsigned => |u| @intCast(u),
+                            .integer => |i| @intCast(i),
+                            else => {
+                                log.warn("focus_event notification: invalid pty_id type", .{});
+                                return;
+                            },
+                        };
+                        const focused: bool = switch (notif.params.array[1]) {
+                            .boolean => |b| b,
+                            else => {
+                                log.warn("focus_event notification: invalid focused type", .{});
+                                return;
+                            },
+                        };
+
+                        if (self.server.ptys.get(pty_id)) |pty_instance| {
+                            pty_instance.terminal_mutex.lock();
+                            const focus_event_enabled = pty_instance.terminal.modes.get(.focus_event);
+                            pty_instance.terminal_mutex.unlock();
+
+                            if (focus_event_enabled) {
+                                const seq: []const u8 = if (focused) "\x1b[I" else "\x1b[O";
+                                _ = posix.write(pty_instance.process.master, seq) catch |err| {
+                                    log.err("Failed to write focus event to PTY: {}", .{err});
+                                };
+                                log.debug("Sent focus {} to PTY {}", .{ focused, pty_id });
+                            }
+                        } else {
+                            log.warn("focus_event notification: PTY {} not found", .{pty_id});
+                        }
+                    } else {
+                        log.warn("focus_event notification: invalid params", .{});
+                    }
                 }
             },
             .response => {

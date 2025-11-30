@@ -1772,6 +1772,29 @@ pub const App = struct {
                                                         log.debug("Sent paste_input: {} bytes to pty {}", .{ data.len, id });
                                                     }
                                                 }.appSendPaste,
+                                                .set_focus_fn = struct {
+                                                    fn appSendFocus(ctx: *anyopaque, id: u32, focused: bool) anyerror!void {
+                                                        const self: *App = @ptrCast(@alignCast(ctx));
+
+                                                        var params = try self.allocator.alloc(msgpack.Value, 2);
+                                                        params[0] = .{ .unsigned = @intCast(id) };
+                                                        params[1] = .{ .boolean = focused };
+
+                                                        var arr = try self.allocator.alloc(msgpack.Value, 3);
+                                                        arr[0] = .{ .unsigned = 2 }; // notification
+                                                        arr[1] = .{ .string = "focus_event" };
+                                                        arr[2] = .{ .array = params };
+
+                                                        const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
+                                                        defer self.allocator.free(encoded_msg);
+
+                                                        self.allocator.free(arr);
+                                                        self.allocator.free(params);
+
+                                                        try self.sendDirect(encoded_msg);
+                                                        log.debug("Sent focus_event: {} to pty {}", .{ focused, id });
+                                                    }
+                                                }.appSendFocus,
                                                 .close_fn = struct {
                                                     fn appClosePty(ctx: *anyopaque, id: u32) anyerror!void {
                                                         const self: *App = @ptrCast(@alignCast(ctx));
@@ -2121,6 +2144,29 @@ pub const App = struct {
                     log.debug("Sent paste_input: {} bytes to pty {}", .{ data.len, pty_id });
                 }
             }.sendPaste,
+            .set_focus_fn = struct {
+                fn sendFocus(app_ctx: *anyopaque, pty_id: u32, focused: bool) anyerror!void {
+                    const app: *App = @ptrCast(@alignCast(app_ctx));
+
+                    var params = try app.allocator.alloc(msgpack.Value, 2);
+                    params[0] = .{ .unsigned = @intCast(pty_id) };
+                    params[1] = .{ .boolean = focused };
+
+                    var arr = try app.allocator.alloc(msgpack.Value, 3);
+                    arr[0] = .{ .unsigned = 2 }; // notification
+                    arr[1] = .{ .string = "focus_event" };
+                    arr[2] = .{ .array = params };
+
+                    const encoded_msg = try msgpack.encodeFromValue(app.allocator, .{ .array = arr });
+                    defer app.allocator.free(encoded_msg);
+
+                    app.allocator.free(arr);
+                    app.allocator.free(params);
+
+                    try app.sendDirect(encoded_msg);
+                    log.debug("Sent focus_event: {} to pty {}", .{ focused, pty_id });
+                }
+            }.sendFocus,
             .close_fn = struct {
                 fn closePty(app_ctx: *anyopaque, pty_id: u32) anyerror!void {
                     const app: *App = @ptrCast(@alignCast(app_ctx));

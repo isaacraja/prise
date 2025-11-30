@@ -66,6 +66,7 @@ local theme = {
 local state = {
     root = nil,
     focused_id = nil,
+    app_focused = true,
     pending_command = false,
     timer = nil,
     pending_split = nil,
@@ -270,6 +271,24 @@ local function get_focused_pty()
     return nil
 end
 
+local function update_pty_focus(old_id, new_id)
+    if old_id == new_id then
+        return
+    end
+    if old_id and state.root then
+        local old_path = find_node_path(state.root, old_id)
+        if old_path then
+            old_path[#old_path].pty:set_focus(false)
+        end
+    end
+    if new_id and state.root and state.app_focused then
+        local new_path = find_node_path(state.root, new_id)
+        if new_path then
+            new_path[#new_path].pty:set_focus(true)
+        end
+    end
+end
+
 ---@param id number
 local function remove_pane_by_id(id)
     local new_root, next_focus = remove_pane_recursive(state.root, id)
@@ -279,6 +298,7 @@ local function remove_pane_by_id(id)
         prise.quit()
     else
         if state.focused_id == id then
+            local old_id = state.focused_id
             if next_focus then
                 state.focused_id = next_focus
             else
@@ -287,6 +307,7 @@ local function remove_pane_by_id(id)
                     state.focused_id = first.id
                 end
             end
+            update_pty_focus(old_id, state.focused_id)
         end
     end
     prise.request_frame()
@@ -529,8 +550,10 @@ local function move_focus(direction)
             target_leaf = get_last_leaf(sibling_node)
         end
 
-        if target_leaf then
+        if target_leaf and target_leaf.id ~= state.focused_id then
+            local old_id = state.focused_id
             state.focused_id = target_leaf.id
+            update_pty_focus(old_id, state.focused_id)
             prise.request_frame()
         end
     end
@@ -665,6 +688,7 @@ function M.update(event)
         prise.log.info("Lua: pty_attach received")
         local pty = event.data.pty
         local new_pane = { type = "pane", pty = pty, id = pty:id() }
+        local old_focused_id = state.focused_id
 
         if not state.root then
             -- First terminal
@@ -695,6 +719,7 @@ function M.update(event)
             state.focused_id = new_pane.id
             state.pending_split = nil
         end
+        update_pty_focus(old_focused_id, state.focused_id)
         prise.request_frame()
     elseif event.type == "key_press" then
         -- Handle command palette
@@ -903,8 +928,10 @@ function M.update(event)
         local d = event.data
         if d.action == "press" and d.button == "left" then
             -- Focus the clicked pane
-            if d.target then
+            if d.target and d.target ~= state.focused_id then
+                local old_id = state.focused_id
                 state.focused_id = d.target
+                update_pty_focus(old_id, state.focused_id)
                 prise.request_frame()
             end
         end
@@ -924,6 +951,18 @@ function M.update(event)
         end
     elseif event.type == "winsize" then
         prise.request_frame()
+    elseif event.type == "focus_in" then
+        state.app_focused = true
+        local pty = get_focused_pty()
+        if pty then
+            pty:set_focus(true)
+        end
+    elseif event.type == "focus_out" then
+        state.app_focused = false
+        local pty = get_focused_pty()
+        if pty then
+            pty:set_focus(false)
+        end
     elseif event.type == "split_resize" then
         -- Handle mouse drag resize
         local d = event.data
