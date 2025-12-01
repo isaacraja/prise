@@ -74,9 +74,18 @@ fn isNamedKey(codepoint: u21) bool {
 }
 
 fn codepointToCode(allocator: std.mem.Allocator, codepoint: u21) ![]const u8 {
-    const Key = vaxis.Key;
+    const code = specialKeyCode(codepoint) orelse
+        letterKeyCode(codepoint) orelse
+        digitKeyCode(codepoint) orelse
+        punctuationKeyCode(codepoint) orelse
+        "Unidentified";
 
-    const code: []const u8 = switch (codepoint) {
+    return try allocator.dupe(u8, code);
+}
+
+fn specialKeyCode(codepoint: u21) ?[]const u8 {
+    const Key = vaxis.Key;
+    return switch (codepoint) {
         Key.enter => "Enter",
         Key.tab => "Tab",
         Key.backspace => "Backspace",
@@ -115,7 +124,12 @@ fn codepointToCode(allocator: std.mem.Allocator, codepoint: u21) ![]const u8 {
         Key.caps_lock => "CapsLock",
         Key.num_lock => "NumLock",
         Key.scroll_lock => "ScrollLock",
-        // Letter keys
+        else => null,
+    };
+}
+
+fn letterKeyCode(codepoint: u21) ?[]const u8 {
+    return switch (codepoint) {
         'a' => "KeyA",
         'b' => "KeyB",
         'c' => "KeyC",
@@ -142,7 +156,12 @@ fn codepointToCode(allocator: std.mem.Allocator, codepoint: u21) ![]const u8 {
         'x' => "KeyX",
         'y' => "KeyY",
         'z' => "KeyZ",
-        // Digits
+        else => null,
+    };
+}
+
+fn digitKeyCode(codepoint: u21) ?[]const u8 {
+    return switch (codepoint) {
         '0' => "Digit0",
         '1' => "Digit1",
         '2' => "Digit2",
@@ -153,7 +172,12 @@ fn codepointToCode(allocator: std.mem.Allocator, codepoint: u21) ![]const u8 {
         '7' => "Digit7",
         '8' => "Digit8",
         '9' => "Digit9",
-        // Punctuation
+        else => null,
+    };
+}
+
+fn punctuationKeyCode(codepoint: u21) ?[]const u8 {
+    return switch (codepoint) {
         '-' => "Minus",
         '=' => "Equal",
         '[' => "BracketLeft",
@@ -165,8 +189,6 @@ fn codepointToCode(allocator: std.mem.Allocator, codepoint: u21) ![]const u8 {
         ',' => "Comma",
         '.' => "Period",
         '/' => "Slash",
-        else => "Unidentified",
+        else => null,
     };
-
-    return try allocator.dupe(u8, code);
 }

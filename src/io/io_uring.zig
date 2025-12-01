@@ -277,97 +277,42 @@ pub const Loop = struct {
             if (op.kind == .timer and cqe.err() == .TIME) {
                 // Timer expired - treat as success
             } else {
-                const err = switch (cqe.err()) {
-                    .CONNREFUSED => error.ConnectionRefused,
-                    .INPROGRESS => error.WouldBlock,
-                    .AGAIN => error.WouldBlock,
-                    .CANCELED => error.Canceled,
-                    else => error.IOError,
-                };
-
-                try ctx.cb(@ptrCast(self), .{
-                    .userdata = ctx.ptr,
-                    .msg = ctx.msg,
-                    .callback = ctx.cb,
-                    .result = .{ .err = err },
-                });
+                const err = mapCqeError(cqe.err());
+                try self.invokeCallback(ctx, .{ .err = err });
                 return;
             }
         }
 
-        switch (op.kind) {
-            .socket => {
-                try ctx.cb(@ptrCast(self), .{
-                    .userdata = ctx.ptr,
-                    .msg = ctx.msg,
-                    .callback = ctx.cb,
-                    .result = .{ .socket = @intCast(cqe.res) },
-                });
-            },
+        const result: root.Result = switch (op.kind) {
+            .socket => .{ .socket = @intCast(cqe.res) },
+            .connect => .{ .connect = {} },
+            .accept => .{ .accept = @intCast(cqe.res) },
+            .read => .{ .read = @intCast(cqe.res) },
+            .recv => .{ .recv = @intCast(cqe.res) },
+            .send => .{ .send = @intCast(cqe.res) },
+            .close => .{ .close = {} },
+            .timer => .{ .timer = {} },
+        };
 
-            .connect => {
-                try ctx.cb(@ptrCast(self), .{
-                    .userdata = ctx.ptr,
-                    .msg = ctx.msg,
-                    .callback = ctx.cb,
-                    .result = .{ .connect = {} },
-                });
-            },
+        try self.invokeCallback(ctx, result);
+    }
 
-            .accept => {
-                try ctx.cb(@ptrCast(self), .{
-                    .userdata = ctx.ptr,
-                    .msg = ctx.msg,
-                    .callback = ctx.cb,
-                    .result = .{ .accept = @intCast(cqe.res) },
-                });
-            },
+    fn mapCqeError(err: std.posix.E) anyerror {
+        return switch (err) {
+            .CONNREFUSED => error.ConnectionRefused,
+            .INPROGRESS, .AGAIN => error.WouldBlock,
+            .CANCELED => error.Canceled,
+            else => error.IOError,
+        };
+    }
 
-            .read => {
-                try ctx.cb(@ptrCast(self), .{
-                    .userdata = ctx.ptr,
-                    .msg = ctx.msg,
-                    .callback = ctx.cb,
-                    .result = .{ .read = @intCast(cqe.res) },
-                });
-            },
-
-            .recv => {
-                try ctx.cb(@ptrCast(self), .{
-                    .userdata = ctx.ptr,
-                    .msg = ctx.msg,
-                    .callback = ctx.cb,
-                    .result = .{ .recv = @intCast(cqe.res) },
-                });
-            },
-
-            .send => {
-                try ctx.cb(@ptrCast(self), .{
-                    .userdata = ctx.ptr,
-                    .msg = ctx.msg,
-                    .callback = ctx.cb,
-                    .result = .{ .send = @intCast(cqe.res) },
-                });
-            },
-
-            .close => {
-                try ctx.cb(@ptrCast(self), .{
-                    .userdata = ctx.ptr,
-                    .msg = ctx.msg,
-                    .callback = ctx.cb,
-                    .result = .{ .close = {} },
-                });
-            },
-
-            .timer => {
-                try ctx.cb(@ptrCast(self), .{
-                    .userdata = ctx.ptr,
-                    .msg = ctx.msg,
-                    .callback = ctx.cb,
-                    .result = .{ .timer = {} },
-                });
-            },
-        }
+    fn invokeCallback(self: *Loop, ctx: root.Context, result: root.Result) !void {
+        try ctx.cb(@ptrCast(self), .{
+            .userdata = ctx.ptr,
+            .msg = ctx.msg,
+            .callback = ctx.cb,
+            .result = result,
+        });
     }
 
     pub const RunMode = enum {

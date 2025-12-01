@@ -378,126 +378,69 @@ pub const Loop = struct {
         const ctx = op.ctx;
 
         if (ev.flags & c.EV.ERROR != 0) {
-            try ctx.cb(@ptrCast(self), .{
-                .userdata = ctx.ptr,
-                .msg = ctx.msg,
-                .callback = ctx.cb,
-                .result = .{ .err = error.IOError },
-            });
+            try self.invokeCallback(ctx, .{ .err = error.IOError });
             return;
         }
 
-        switch (op.kind) {
-            .connect => {
-                var err_code: i32 = undefined;
-                var len: posix.socklen_t = @sizeOf(i32);
-                _ = posix.system.getsockopt(op.fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&err_code), &len);
-
-                if (err_code == 0) {
-                    try ctx.cb(@ptrCast(self), .{
-                        .userdata = ctx.ptr,
-                        .msg = ctx.msg,
-                        .callback = ctx.cb,
-                        .result = .{ .connect = {} },
-                    });
-                } else {
-                    const err = posix.unexpectedErrno(@enumFromInt(err_code));
-                    try ctx.cb(@ptrCast(self), .{
-                        .userdata = ctx.ptr,
-                        .msg = ctx.msg,
-                        .callback = ctx.cb,
-                        .result = .{ .err = err },
-                    });
-                }
-            },
-
-            .accept => {
-                const client_fd = posix.accept(op.fd, null, null, posix.SOCK.CLOEXEC) catch |err| {
-                    try ctx.cb(@ptrCast(self), .{
-                        .userdata = ctx.ptr,
-                        .msg = ctx.msg,
-                        .callback = ctx.cb,
-                        .result = .{ .err = err },
-                    });
-                    return;
-                };
-
-                try ctx.cb(@ptrCast(self), .{
-                    .userdata = ctx.ptr,
-                    .msg = ctx.msg,
-                    .callback = ctx.cb,
-                    .result = .{ .accept = client_fd },
-                });
-            },
-
-            .read => {
-                const bytes_read = posix.read(op.fd, op.buf) catch |err| {
-                    try ctx.cb(@ptrCast(self), .{
-                        .userdata = ctx.ptr,
-                        .msg = ctx.msg,
-                        .callback = ctx.cb,
-                        .result = .{ .err = err },
-                    });
-                    return;
-                };
-
-                try ctx.cb(@ptrCast(self), .{
-                    .userdata = ctx.ptr,
-                    .msg = ctx.msg,
-                    .callback = ctx.cb,
-                    .result = .{ .read = bytes_read },
-                });
-            },
-
-            .recv => {
-                const bytes_read = posix.recv(op.fd, op.buf, 0) catch |err| {
-                    try ctx.cb(@ptrCast(self), .{
-                        .userdata = ctx.ptr,
-                        .msg = ctx.msg,
-                        .callback = ctx.cb,
-                        .result = .{ .err = err },
-                    });
-                    return;
-                };
-
-                try ctx.cb(@ptrCast(self), .{
-                    .userdata = ctx.ptr,
-                    .msg = ctx.msg,
-                    .callback = ctx.cb,
-                    .result = .{ .recv = bytes_read },
-                });
-            },
-
-            .send => {
-                const bytes_sent = posix.send(op.fd, op.buf, 0) catch |err| {
-                    try ctx.cb(@ptrCast(self), .{
-                        .userdata = ctx.ptr,
-                        .msg = ctx.msg,
-                        .callback = ctx.cb,
-                        .result = .{ .err = err },
-                    });
-                    return;
-                };
-
-                try ctx.cb(@ptrCast(self), .{
-                    .userdata = ctx.ptr,
-                    .msg = ctx.msg,
-                    .callback = ctx.cb,
-                    .result = .{ .send = bytes_sent },
-                });
-            },
-
-            .timer => {
-                try ctx.cb(@ptrCast(self), .{
-                    .userdata = ctx.ptr,
-                    .msg = ctx.msg,
-                    .callback = ctx.cb,
-                    .result = .{ .timer = {} },
-                });
-            },
-
+        const result: root.Result = switch (op.kind) {
+            .connect => self.completeConnect(op.fd),
+            .accept => self.completeAccept(op.fd),
+            .read => self.completeRead(op.fd, op.buf),
+            .recv => self.completeRecv(op.fd, op.buf),
+            .send => self.completeSend(op.fd, op.buf),
+            .timer => .{ .timer = {} },
             .socket, .close => unreachable,
+        };
+
+        try self.invokeCallback(ctx, result);
+    }
+
+    fn invokeCallback(self: *Loop, ctx: root.Context, result: root.Result) !void {
+        try ctx.cb(@ptrCast(self), .{
+            .userdata = ctx.ptr,
+            .msg = ctx.msg,
+            .callback = ctx.cb,
+            .result = result,
+        });
+    }
+
+    fn completeConnect(_: *Loop, fd: posix.fd_t) root.Result {
+        var err_code: i32 = undefined;
+        var len: posix.socklen_t = @sizeOf(i32);
+        _ = posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&err_code), &len);
+
+        if (err_code == 0) {
+            return .{ .connect = {} };
         }
+        return .{ .err = posix.unexpectedErrno(@enumFromInt(err_code)) };
+    }
+
+    fn completeAccept(_: *Loop, fd: posix.fd_t) root.Result {
+        const client_fd = posix.accept(fd, null, null, posix.SOCK.CLOEXEC) catch |err| {
+            return .{ .err = err };
+        };
+        return .{ .accept = client_fd };
+    }
+
+    fn completeRead(_: *Loop, fd: posix.fd_t, buf: []u8) root.Result {
+        const bytes_read = posix.read(fd, buf) catch |err| {
+            return .{ .err = err };
+        };
+        return .{ .read = bytes_read };
+    }
+
+    fn completeRecv(_: *Loop, fd: posix.fd_t, buf: []u8) root.Result {
+        const bytes_read = posix.recv(fd, buf, 0) catch |err| {
+            return .{ .err = err };
+        };
+        return .{ .recv = bytes_read };
+    }
+
+    fn completeSend(_: *Loop, fd: posix.fd_t, buf: []const u8) root.Result {
+        const bytes_sent = posix.send(fd, buf, 0) catch |err| {
+            return .{ .err = err };
+        };
+        return .{ .send = bytes_sent };
     }
 
     pub const RunMode = enum {

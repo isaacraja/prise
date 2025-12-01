@@ -673,135 +673,93 @@ pub const Decoder = struct {
         const byte = self.data[self.pos];
         self.pos += 1;
 
-        if (byte <= 0x7f) return;
-        if (byte >= 0xe0) return;
+        if (byte <= 0x7f or byte >= 0xe0) return;
         if (byte == 0xc0 or byte == 0xc2 or byte == 0xc3) return;
 
-        // Float/Int fixed size
-        if (byte == 0xcc or byte == 0xd0) {
-            self.pos += 1;
-            return;
-        }
-        if (byte == 0xcd or byte == 0xd1 or byte == 0xd4) {
-            self.pos += 2;
-            return;
-        }
-        if (byte == 0xce or byte == 0xd2 or byte == 0xca) {
-            self.pos += 4;
-            return;
-        }
-        if (byte == 0xcf or byte == 0xd3 or byte == 0xcb) {
-            self.pos += 8;
-            return;
-        }
-        if (byte == 0xd4) {
-            self.pos += 1;
-            return;
-        } // fixext1
-        if (byte == 0xd5) {
-            self.pos += 2;
-            return;
-        } // fixext2
-        if (byte == 0xd6) {
-            self.pos += 4;
-            return;
-        } // fixext4
-        if (byte == 0xd7) {
-            self.pos += 8;
-            return;
-        } // fixext8
-        if (byte == 0xd8) {
-            self.pos += 16;
-            return;
-        } // fixext16
-
-        // Str/Bin
-        if (byte >= 0xa0 and byte <= 0xbf) { // fixstr
-            const len = byte & 0x1f;
-            self.pos += len;
-            return;
-        }
-        if (byte == 0xd9 or byte == 0xc4) { // str8/bin8
-            if (self.pos >= self.data.len) return error.UnexpectedEndOfInput;
-            const len = self.data[self.pos];
-            self.pos += 1;
-            self.pos += len;
-            return;
-        }
-        if (byte == 0xda or byte == 0xc5) { // str16/bin16
-            const len = try self.readU16();
-            self.pos += len;
-            return;
-        }
-        if (byte == 0xdb or byte == 0xc6) { // str32/bin32
-            const len = try self.readU32();
-            self.pos += len;
-            return;
-        }
-
-        // Ext (variable)
-        if (byte == 0xc7) { // ext8
-            if (self.pos >= self.data.len) return error.UnexpectedEndOfInput;
-            const len = self.data[self.pos];
-            self.pos += 1;
-            self.pos += 1; // type
-            self.pos += len;
-            return;
-        }
-        if (byte == 0xc8) { // ext16
-            const len = try self.readU16();
-            self.pos += 1; // type
-            self.pos += len;
-            return;
-        }
-        if (byte == 0xc9) { // ext32
-            const len = try self.readU32();
-            self.pos += 1; // type
-            self.pos += len;
-            return;
-        }
-
-        // Array
-        if (byte >= 0x90 and byte <= 0x9f) { // fixarray
-            const len = byte & 0x0f;
-            var i: usize = 0;
-            while (i < len) : (i += 1) try self.skipValue();
-            return;
-        }
-        if (byte == 0xdc) { // array16
-            const len = try self.readU16();
-            var i: usize = 0;
-            while (i < len) : (i += 1) try self.skipValue();
-            return;
-        }
-        if (byte == 0xdd) { // array32
-            const len = try self.readU32();
-            var i: usize = 0;
-            while (i < len) : (i += 1) try self.skipValue();
-            return;
-        }
-
-        // Map
-        if (byte >= 0x80 and byte <= 0x8f) { // fixmap
-            const len = byte & 0x0f;
-            var i: usize = 0;
-            while (i < len * 2) : (i += 1) try self.skipValue();
-            return;
-        }
-        if (byte == 0xde) { // map16
-            const len = try self.readU16();
-            var i: usize = 0;
-            while (i < len * 2) : (i += 1) try self.skipValue();
-            return;
-        }
-        if (byte == 0xdf) { // map32
-            const len = try self.readU32();
-            var i: usize = 0;
-            while (i < len * 2) : (i += 1) try self.skipValue();
-            return;
-        }
+        if (self.skipFixedSize(byte)) |_| return;
+        if (try self.skipStringOrBinary(byte)) return;
+        if (try self.skipExtension(byte)) return;
+        if (try self.skipArray(byte)) return;
+        if (try self.skipMap(byte)) return;
 
         return error.InvalidFormat;
+    }
+
+    fn skipFixedSize(self: *Decoder, byte: u8) ?void {
+        const size: usize = switch (byte) {
+            0xcc, 0xd0, 0xd4 => 1,
+            0xcd, 0xd1, 0xd5 => 2,
+            0xce, 0xd2, 0xca, 0xd6 => 4,
+            0xcf, 0xd3, 0xcb, 0xd7 => 8,
+            0xd8 => 16,
+            else => return null,
+        };
+        self.pos += size;
+        return;
+    }
+
+    fn skipStringOrBinary(self: *Decoder, byte: u8) DecodeError!bool {
+        if (byte >= 0xa0 and byte <= 0xbf) {
+            self.pos += byte & 0x1f;
+            return true;
+        }
+
+        const len: usize = switch (byte) {
+            0xd9, 0xc4 => blk: {
+                if (self.pos >= self.data.len) return error.UnexpectedEndOfInput;
+                const l = self.data[self.pos];
+                self.pos += 1;
+                break :blk l;
+            },
+            0xda, 0xc5 => try self.readU16(),
+            0xdb, 0xc6 => try self.readU32(),
+            else => return false,
+        };
+        self.pos += len;
+        return true;
+    }
+
+    fn skipExtension(self: *Decoder, byte: u8) DecodeError!bool {
+        const len: usize = switch (byte) {
+            0xc7 => blk: {
+                if (self.pos >= self.data.len) return error.UnexpectedEndOfInput;
+                const l = self.data[self.pos];
+                self.pos += 1;
+                break :blk l;
+            },
+            0xc8 => try self.readU16(),
+            0xc9 => try self.readU32(),
+            else => return false,
+        };
+        self.pos += 1; // type byte
+        self.pos += len;
+        return true;
+    }
+
+    fn skipArray(self: *Decoder, byte: u8) DecodeError!bool {
+        const len: usize = if (byte >= 0x90 and byte <= 0x9f)
+            byte & 0x0f
+        else switch (byte) {
+            0xdc => try self.readU16(),
+            0xdd => try self.readU32(),
+            else => return false,
+        };
+
+        for (0..len) |_| try self.skipValue();
+        return true;
+    }
+
+    fn skipMap(self: *Decoder, byte: u8) DecodeError!bool {
+        const len: usize = if (byte >= 0x80 and byte <= 0x8f)
+            byte & 0x0f
+        else switch (byte) {
+            0xde => try self.readU16(),
+            0xdf => try self.readU32(),
+            else => return false,
+        };
+
+        for (0..len * 2) |_| try self.skipValue();
+        return true;
     }
 
     pub fn peekByte(self: *Decoder) !u8 {

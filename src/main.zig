@@ -81,54 +81,63 @@ pub fn main() !void {
     var socket_buffer: [256]u8 = undefined;
     const socket_path = try std.fmt.bufPrint(&socket_buffer, "/tmp/prise-{d}.sock", .{uid});
 
-    // Check for commands
+    const attach_session = try parseArgs(allocator, socket_path) orelse return;
+    try runClient(allocator, socket_path, attach_session);
+}
+
+fn parseArgs(allocator: std.mem.Allocator, socket_path: []const u8) !?(?[]const u8) {
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
-    _ = args.skip(); // skip program name
+    _ = args.skip();
 
-    var attach_session: ?[]const u8 = null;
+    const cmd = args.next() orelse return @as(?[]const u8, null);
 
-    if (args.next()) |cmd| {
-        if (std.mem.eql(u8, cmd, "serve")) {
-            initLogFile("server.log");
-            try server.startServer(allocator, socket_path);
-            return;
-        } else if (std.mem.eql(u8, cmd, "session")) {
-            if (args.next()) |subcmd| {
-                if (std.mem.eql(u8, subcmd, "attach")) {
-                    if (args.next()) |session_name| {
-                        attach_session = session_name;
-                    } else {
-                        attach_session = try findMostRecentSession(allocator);
-                    }
-                } else if (std.mem.eql(u8, subcmd, "list")) {
-                    try listSessions(allocator);
-                    return;
-                } else {
-                    log.err("Unknown session command: {s}", .{subcmd});
-                    log.err("Available commands: attach, list", .{});
-                    return error.UnknownCommand;
-                }
-            } else {
-                log.err("Missing session command. Available commands: attach, list", .{});
-                return error.MissingCommand;
-            }
-        } else if (std.mem.eql(u8, cmd, "pty")) {
-            if (args.next()) |subcmd| {
-                _ = subcmd;
-                log.err("pty commands not yet implemented", .{});
-                return error.NotImplemented;
-            } else {
-                log.err("Missing pty command. Available commands: spawn, capture, kill", .{});
-                return error.MissingCommand;
-            }
-        } else {
-            log.err("Unknown command: {s}", .{cmd});
-            log.err("Available commands: serve, session, pty", .{});
-            return error.UnknownCommand;
-        }
+    if (std.mem.eql(u8, cmd, "serve")) {
+        initLogFile("server.log");
+        try server.startServer(allocator, socket_path);
+        return null;
+    } else if (std.mem.eql(u8, cmd, "session")) {
+        return try handleSessionCommand(allocator, &args);
+    } else if (std.mem.eql(u8, cmd, "pty")) {
+        return try handlePtyCommand(&args);
+    } else {
+        log.err("Unknown command: {s}", .{cmd});
+        log.err("Available commands: serve, session, pty", .{});
+        return error.UnknownCommand;
     }
+}
 
+fn handleSessionCommand(allocator: std.mem.Allocator, args: *std.process.ArgIterator) !?(?[]const u8) {
+    const subcmd = args.next() orelse {
+        log.err("Missing session command. Available commands: attach, list", .{});
+        return error.MissingCommand;
+    };
+
+    if (std.mem.eql(u8, subcmd, "attach")) {
+        const session = args.next() orelse try findMostRecentSession(allocator);
+        return @as(?[]const u8, session);
+    } else if (std.mem.eql(u8, subcmd, "list")) {
+        try listSessions(allocator);
+        return null;
+    } else {
+        log.err("Unknown session command: {s}", .{subcmd});
+        log.err("Available commands: attach, list", .{});
+        return error.UnknownCommand;
+    }
+}
+
+fn handlePtyCommand(args: *std.process.ArgIterator) !?(?[]const u8) {
+    if (args.next()) |subcmd| {
+        _ = subcmd;
+        log.err("pty commands not yet implemented", .{});
+        return error.NotImplemented;
+    } else {
+        log.err("Missing pty command. Available commands: spawn, capture, kill", .{});
+        return error.MissingCommand;
+    }
+}
+
+fn runClient(allocator: std.mem.Allocator, socket_path: []const u8, attach_session: ?[]const u8) !void {
     std.fs.accessAbsolute(socket_path, .{}) catch |err| {
         if (err == error.FileNotFound) {
             log.err("Server not running. Start it with: prise serve", .{});
@@ -150,9 +159,6 @@ pub fn main() !void {
     app.attach_session = attach_session;
 
     try app.setup(&loop);
-
-    // Connection will be initiated after first winsize event from TTY
-
     try loop.run(.until_done);
 
     if (app.state.connection_refused) {

@@ -334,94 +334,80 @@ pub const Handler = struct {
     }
 
     fn setMode(self: *Handler, mode: modes.Mode, enabled: bool) !void {
-        // Set the mode on the terminal
         self.terminal.modes.set(mode, enabled);
 
-        // Some modes require additional processing
         switch (mode) {
-            .autorepeat,
-            .reverse_colors,
-            => {},
-
+            .autorepeat, .reverse_colors, .enable_mode_3, .synchronized_output, .linefeed, .focus_event => {},
             .origin => self.terminal.setCursorPos(1, 1),
-
-            .enable_left_and_right_margin => if (!enabled) {
-                self.terminal.scrolling_region.left = 0;
-                self.terminal.scrolling_region.right = self.terminal.cols - 1;
-            },
-
+            .enable_left_and_right_margin => self.handleLeftRightMargin(enabled),
             .alt_screen_legacy => try self.terminal.switchScreenMode(.@"47", enabled),
             .alt_screen => try self.terminal.switchScreenMode(.@"1047", enabled),
             .alt_screen_save_cursor_clear_enter => try self.terminal.switchScreenMode(.@"1049", enabled),
-
-            .save_cursor => if (enabled) {
-                self.terminal.saveCursor();
-            } else {
-                try self.terminal.restoreCursor();
-            },
-
-            .enable_mode_3 => {},
-
+            .save_cursor => try self.handleSaveCursor(enabled),
             .@"132_column" => try self.terminal.deccolm(
                 self.terminal.screens.active.alloc,
                 if (enabled) .@"132_cols" else .@"80_cols",
             ),
-
-            .synchronized_output,
-            .linefeed,
-            .focus_event,
-            => {},
-
-            .in_band_size_reports => {
-                // Send immediate size report when mode is enabled (or re-enabled)
-                if (enabled) {
-                    var buf: [64]u8 = undefined;
-                    const report = std.fmt.bufPrint(&buf, "\x1b[48;{};{};{};{}t", .{
-                        self.terminal.rows,
-                        self.terminal.cols,
-                        self.terminal.height_px,
-                        self.terminal.width_px,
-                    }) catch return;
-                    try self.write(report);
-                }
-            },
-
-            .mouse_event_x10 => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .x10;
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                }
-            },
-            .mouse_event_normal => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .normal;
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                }
-            },
-            .mouse_event_button => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .button;
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                }
-            },
-            .mouse_event_any => {
-                if (enabled) {
-                    self.terminal.flags.mouse_event = .any;
-                } else {
-                    self.terminal.flags.mouse_event = .none;
-                }
-            },
-
-            .mouse_format_utf8 => self.terminal.flags.mouse_format = if (enabled) .utf8 else .x10,
-            .mouse_format_sgr => self.terminal.flags.mouse_format = if (enabled) .sgr else .x10,
-            .mouse_format_urxvt => self.terminal.flags.mouse_format = if (enabled) .urxvt else .x10,
-            .mouse_format_sgr_pixels => self.terminal.flags.mouse_format = if (enabled) .sgr_pixels else .x10,
-
+            .in_band_size_reports => try self.handleInBandSizeReports(enabled),
+            .mouse_event_x10,
+            .mouse_event_normal,
+            .mouse_event_button,
+            .mouse_event_any,
+            => self.handleMouseEvent(mode, enabled),
+            .mouse_format_utf8,
+            .mouse_format_sgr,
+            .mouse_format_urxvt,
+            .mouse_format_sgr_pixels,
+            => self.handleMouseFormat(mode, enabled),
             else => {},
         }
+    }
+
+    fn handleLeftRightMargin(self: *Handler, enabled: bool) void {
+        if (!enabled) {
+            self.terminal.scrolling_region.left = 0;
+            self.terminal.scrolling_region.right = self.terminal.cols - 1;
+        }
+    }
+
+    fn handleSaveCursor(self: *Handler, enabled: bool) !void {
+        if (enabled) {
+            self.terminal.saveCursor();
+        } else {
+            try self.terminal.restoreCursor();
+        }
+    }
+
+    fn handleInBandSizeReports(self: *Handler, enabled: bool) !void {
+        if (!enabled) return;
+        var buf: [64]u8 = undefined;
+        const report = std.fmt.bufPrint(&buf, "\x1b[48;{};{};{};{}t", .{
+            self.terminal.rows,
+            self.terminal.cols,
+            self.terminal.height_px,
+            self.terminal.width_px,
+        }) catch return;
+        try self.write(report);
+    }
+
+    fn handleMouseEvent(self: *Handler, mode: modes.Mode, enabled: bool) void {
+        self.terminal.flags.mouse_event = if (enabled) switch (mode) {
+            .mouse_event_x10 => .x10,
+            .mouse_event_normal => .normal,
+            .mouse_event_button => .button,
+            .mouse_event_any => .any,
+            else => unreachable,
+        } else .none;
+    }
+
+    fn handleMouseFormat(self: *Handler, mode: modes.Mode, enabled: bool) void {
+        self.terminal.flags.mouse_format = if (enabled) switch (mode) {
+            .mouse_format_utf8 => .utf8,
+            .mouse_format_sgr => .sgr,
+            .mouse_format_urxvt => .urxvt,
+            .mouse_format_sgr_pixels => .sgr_pixels,
+            else => unreachable,
+        } else .x10;
     }
 
     fn colorOperation(

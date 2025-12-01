@@ -543,106 +543,83 @@ const fallback_palette: [16]vaxis.Cell.Color = .{
 };
 
 pub fn render(self: *const Surface, win: vaxis.Window, focused: bool, terminal_colors: *const client.App.TerminalColors, dim_factor: f32) void {
-    // Copy front buffer to vaxis window
     for (0..self.rows) |row| {
         for (0..self.cols) |col| {
-            if (col < win.width and row < win.height) {
-                var cell = self.front.readCell(@intCast(col), @intCast(row)) orelse continue;
+            if (col >= win.width or row >= win.height) continue;
 
-                // Apply selection highlight (dark blue background)
-                if (self.isCellSelected(@intCast(row), @intCast(col))) {
-                    cell.style.bg = .{ .rgb = .{ 0x26, 0x4f, 0x78 } }; // Dark blue
-                }
+            var cell = self.front.readCell(@intCast(col), @intCast(row)) orelse continue;
 
-                // Apply dimming if needed
-                if (dim_factor > 0.0) {
-                    // Resolve background color
-                    var bg_rgb: [3]u8 = undefined;
-                    var has_bg = false;
-
-                    const bg = cell.style.bg;
-                    switch (bg) {
-                        .rgb => |rgb| {
-                            bg_rgb = rgb;
-                            has_bg = true;
-                        },
-                        .index => |idx| {
-                            if (idx < 16) {
-                                // Try terminal colors first, then fallback
-                                if (terminal_colors.palette[idx]) |c_val| {
-                                    switch (c_val) {
-                                        .rgb => |rgb| {
-                                            bg_rgb = rgb;
-                                            has_bg = true;
-                                        },
-                                        else => {},
-                                    }
-                                } else {
-                                    switch (fallback_palette[idx]) {
-                                        .rgb => |rgb| {
-                                            bg_rgb = rgb;
-                                            has_bg = true;
-                                        },
-                                        else => {},
-                                    }
-                                }
-                            } else {
-                                // Extended palette 16-255: use standard xterm palette (not implemented yet, just use default logic or map)
-                                // For now, just keep as is if > 15, or implement xterm 256 lookup
-                                // Let's skip dimming for indices > 15 if we don't have a lookup table,
-                                // OR just let vaxis handle it.
-                                // But to dim, we NEED to know the RGB.
-                                // For now, only dim if we can resolve RGB.
-                                win.writeCell(@intCast(col), @intCast(row), cell);
-                                continue;
-                            }
-                        },
-                        .default => {
-                            if (terminal_colors.bg) |c| {
-                                switch (c) {
-                                    .rgb => |rgb| {
-                                        bg_rgb = rgb;
-                                        has_bg = true;
-                                    },
-                                    else => {
-                                        bg_rgb = .{ 0, 0, 0 };
-                                        has_bg = true;
-                                    },
-                                }
-                            } else {
-                                // Assume black if unknown default
-                                bg_rgb = .{ 0, 0, 0 };
-                                has_bg = true;
-                            }
-                        },
-                    }
-
-                    // Calculate dimmed background
-                    if (has_bg) {
-                        const dimmed_bg = client.App.TerminalColors.reduceContrast(bg_rgb, dim_factor);
-                        cell.style.bg = .{ .rgb = dimmed_bg };
-                    }
-                }
-
-                win.writeCell(@intCast(col), @intCast(row), cell);
+            if (self.isCellSelected(@intCast(row), @intCast(col))) {
+                cell.style.bg = .{ .rgb = .{ 0x26, 0x4f, 0x78 } };
             }
+
+            if (dim_factor > 0.0) {
+                if (!self.applyDimming(&cell, terminal_colors, dim_factor)) {
+                    win.writeCell(@intCast(col), @intCast(row), cell);
+                    continue;
+                }
+            }
+
+            win.writeCell(@intCast(col), @intCast(row), cell);
         }
     }
 
-    // Copy cursor state to window only if focused
-    if (focused and
-        self.front.cursor_vis and
-        self.front.cursor_col < win.width and
-        self.front.cursor_row < win.height)
-    {
-        win.showCursor(self.front.cursor_col, self.front.cursor_row);
-        const shape: vaxis.Cell.CursorShape = switch (self.cursor_shape) {
-            .block => .block,
-            .beam => .beam,
-            .underline => .underline,
+    self.renderCursor(win, focused);
+}
+
+fn applyDimming(self: *const Surface, cell: *vaxis.Cell, terminal_colors: *const client.App.TerminalColors, dim_factor: f32) bool {
+    _ = self;
+    const bg_rgb = resolveBgColor(cell.style.bg, terminal_colors) orelse return false;
+    const dimmed_bg = client.App.TerminalColors.reduceContrast(bg_rgb, dim_factor);
+    cell.style.bg = .{ .rgb = dimmed_bg };
+    return true;
+}
+
+fn resolveBgColor(bg: vaxis.Cell.Color, terminal_colors: *const client.App.TerminalColors) ?[3]u8 {
+    return switch (bg) {
+        .rgb => |rgb| rgb,
+        .index => |idx| resolvePaletteColor(idx, terminal_colors),
+        .default => resolveDefaultBg(terminal_colors),
+    };
+}
+
+fn resolvePaletteColor(idx: u8, terminal_colors: *const client.App.TerminalColors) ?[3]u8 {
+    if (idx >= 16) return null;
+
+    if (terminal_colors.palette[idx]) |c_val| {
+        return switch (c_val) {
+            .rgb => |rgb| rgb,
+            else => null,
         };
-        win.setCursorShape(shape);
     }
+
+    return switch (fallback_palette[idx]) {
+        .rgb => |rgb| rgb,
+        else => null,
+    };
+}
+
+fn resolveDefaultBg(terminal_colors: *const client.App.TerminalColors) [3]u8 {
+    if (terminal_colors.bg) |c| {
+        return switch (c) {
+            .rgb => |rgb| rgb,
+            else => .{ 0, 0, 0 },
+        };
+    }
+    return .{ 0, 0, 0 };
+}
+
+fn renderCursor(self: *const Surface, win: vaxis.Window, focused: bool) void {
+    if (!focused or !self.front.cursor_vis) return;
+    if (self.front.cursor_col >= win.width or self.front.cursor_row >= win.height) return;
+
+    win.showCursor(self.front.cursor_col, self.front.cursor_row);
+    const shape: vaxis.Cell.CursorShape = switch (self.cursor_shape) {
+        .block => .block,
+        .beam => .beam,
+        .underline => .underline,
+    };
+    win.setCursorShape(shape);
 }
 
 pub fn getTitle(self: *Surface) []const u8 {

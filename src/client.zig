@@ -216,144 +216,160 @@ pub const PipeAction = union(enum) {
 
 pub const ClientLogic = struct {
     pub fn processServerMessage(state: *ClientState, msg: rpc.Message) !ServerAction {
-        switch (msg) {
-            .response => |resp| {
-                state.response_received = true;
-
-                log.info("processServerMessage: response msgid={}", .{resp.msgid});
-                const request_info = state.pending_requests.fetchRemove(resp.msgid);
-
-                if (resp.err) |err_val| {
-                    if (request_info) |entry| {
-                        switch (entry.value) {
-                            .attach => |attach_info| {
-                                // If attach fails with "PTY not found", try spawn_pty with cwd
-                                if (err_val == .string) {
-                                    if (std.mem.eql(u8, err_val.string, "PTY not found")) {
-                                        log.info("PTY {} not found, spawning new PTY with cwd", .{attach_info.pty_id});
-                                        return .{ .spawn_pty_with_cwd = .{ .cwd = attach_info.cwd } };
-                                    }
-                                }
-                            },
-                            else => {},
-                        }
-                    }
-                    log.err("Error in response: {}", .{err_val});
-                    return .none;
-                } else {
-                    if (request_info) |entry| {
-                        log.info("processServerMessage: found pending request: {s}", .{@tagName(entry.value)});
-                        switch (entry.value) {
-                            .spawn => {
-                                const id: i64 = switch (resp.result) {
-                                    .integer => |i| i,
-                                    .unsigned => |u| @intCast(u),
-                                    else => -1,
-                                };
-                                log.info("processServerMessage: spawn result id={}", .{id});
-                                if (id >= 0) {
-                                    state.pty_id = id; // Last attached
-                                    state.attached = true;
-                                    return .{ .attached = id };
-                                }
-                            },
-                            .attach => |attach_info| {
-                                state.pty_id = attach_info.pty_id;
-                                state.attached = true;
-                                return .{ .attached = attach_info.pty_id };
-                            },
-                            .detach => {
-                                return ServerAction.detached;
-                            },
-                        }
-                    } else {
-                        switch (resp.result) {
-                            .integer => |i| {
-                                // Legacy fallback or unsolicited?
-                                if (state.pty_id == null) {
-                                    state.pty_id = i;
-                                    return .{ .send_attach = i };
-                                } else if (!state.attached) {
-                                    state.attached = true;
-                                    return .{ .attached = i };
-                                }
-                            },
-                            .unsigned => |u| {
-                                if (state.pty_id == null) {
-                                    state.pty_id = @intCast(u);
-                                    state.attached = true;
-                                    return .{ .attached = @intCast(u) };
-                                } else if (!state.attached) {
-                                    state.attached = true;
-                                    return .{ .attached = @intCast(u) };
-                                }
-                            },
-                            .string => |s| {
-                                log.info("{s}", .{s});
-                                return .none;
-                            },
-                            else => {
-                                log.info("Unknown result type", .{});
-                                return .none;
-                            },
-                        }
-                    }
-                }
-            },
+        return switch (msg) {
+            .response => |resp| processResponse(state, resp),
             .request => {
                 log.warn("Got unexpected request from server", .{});
                 return .none;
             },
-            .notification => |notif| {
-                if (std.mem.eql(u8, notif.method, "redraw")) {
-                    return .{ .redraw = notif.params };
-                } else if (std.mem.eql(u8, notif.method, "pty_exited")) {
-                    if (notif.params == .array and notif.params.array.len >= 2) {
-                        const pty_id = switch (notif.params.array[0]) {
-                            .integer => |i| @as(u32, @intCast(i)),
-                            .unsigned => |u| @as(u32, @intCast(u)),
-                            else => 0,
-                        };
-                        const status = switch (notif.params.array[1]) {
-                            .integer => |i| @as(u32, @intCast(i)),
-                            .unsigned => |u| @as(u32, @intCast(u)),
-                            else => 0,
-                        };
-                        return .{ .pty_exited = .{ .pty_id = pty_id, .status = status } };
-                    }
-                } else if (std.mem.eql(u8, notif.method, "cwd_changed")) {
-                    if (notif.params == .map) {
-                        var pty_id_val: ?msgpack.Value = null;
-                        var cwd_val: ?msgpack.Value = null;
-                        for (notif.params.map) |kv| {
-                            if (kv.key == .string) {
-                                if (std.mem.eql(u8, kv.key.string, "pty_id")) {
-                                    pty_id_val = kv.value;
-                                } else if (std.mem.eql(u8, kv.key.string, "cwd")) {
-                                    cwd_val = kv.value;
-                                }
-                            }
-                        }
-                        if (pty_id_val) |pty_id_v| {
-                            const pty_id = switch (pty_id_v) {
-                                .integer => |i| @as(i64, @intCast(i)),
-                                .unsigned => |u| @as(i64, @intCast(u)),
-                                else => return .none,
-                            };
-                            if (cwd_val) |cwd_v| {
-                                if (cwd_v == .string) {
-                                    if (state.cwd_map.getPtr(pty_id)) |entry| {
-                                        state.allocator.free(entry.*);
-                                    }
-                                    state.cwd_map.put(pty_id, try state.allocator.dupe(u8, cwd_v.string)) catch return .none;
-                                }
-                            }
-                        }
-                    }
+            .notification => |notif| try processNotification(state, notif),
+        };
+    }
+
+    fn processResponse(state: *ClientState, resp: rpc.Response) ServerAction {
+        state.response_received = true;
+        log.info("processServerMessage: response msgid={}", .{resp.msgid});
+        const request_info = state.pending_requests.fetchRemove(resp.msgid);
+
+        if (resp.err) |err_val| {
+            return handleResponseError(err_val, request_info);
+        }
+        return handleResponseResult(state, resp.result, request_info);
+    }
+
+    fn handleResponseError(err_val: msgpack.Value, request_info: ?std.AutoHashMap(u32, ClientState.RequestInfo).KV) ServerAction {
+        if (request_info) |entry| {
+            if (entry.value == .attach) {
+                const attach_info = entry.value.attach;
+                if (err_val == .string and std.mem.eql(u8, err_val.string, "PTY not found")) {
+                    log.info("PTY {} not found, spawning new PTY with cwd", .{attach_info.pty_id});
+                    return .{ .spawn_pty_with_cwd = .{ .cwd = attach_info.cwd } };
                 }
-            },
+            }
+        }
+        log.err("Error in response: {}", .{err_val});
+        return .none;
+    }
+
+    fn handleResponseResult(state: *ClientState, result: msgpack.Value, request_info: ?std.AutoHashMap(u32, ClientState.RequestInfo).KV) ServerAction {
+        if (request_info) |entry| {
+            log.info("processServerMessage: found pending request: {s}", .{@tagName(entry.value)});
+            return switch (entry.value) {
+                .spawn => handleSpawnResult(state, result),
+                .attach => |attach_info| {
+                    state.pty_id = attach_info.pty_id;
+                    state.attached = true;
+                    return .{ .attached = attach_info.pty_id };
+                },
+                .detach => .detached,
+            };
+        }
+        return handleUnsolicitedResult(state, result);
+    }
+
+    fn handleSpawnResult(state: *ClientState, result: msgpack.Value) ServerAction {
+        const id: i64 = switch (result) {
+            .integer => |i| i,
+            .unsigned => |u| @intCast(u),
+            else => -1,
+        };
+        log.info("processServerMessage: spawn result id={}", .{id});
+        if (id >= 0) {
+            state.pty_id = id;
+            state.attached = true;
+            return .{ .attached = id };
         }
         return .none;
+    }
+
+    fn handleUnsolicitedResult(state: *ClientState, result: msgpack.Value) ServerAction {
+        return switch (result) {
+            .integer => |i| {
+                if (state.pty_id == null) {
+                    state.pty_id = i;
+                    return .{ .send_attach = i };
+                } else if (!state.attached) {
+                    state.attached = true;
+                    return .{ .attached = i };
+                }
+                return .none;
+            },
+            .unsigned => |u| {
+                if (state.pty_id == null) {
+                    state.pty_id = @intCast(u);
+                    state.attached = true;
+                    return .{ .attached = @intCast(u) };
+                } else if (!state.attached) {
+                    state.attached = true;
+                    return .{ .attached = @intCast(u) };
+                }
+                return .none;
+            },
+            .string => |s| {
+                log.info("{s}", .{s});
+                return .none;
+            },
+            else => {
+                log.info("Unknown result type", .{});
+                return .none;
+            },
+        };
+    }
+
+    fn processNotification(state: *ClientState, notif: rpc.Notification) !ServerAction {
+        if (std.mem.eql(u8, notif.method, "redraw")) {
+            return .{ .redraw = notif.params };
+        } else if (std.mem.eql(u8, notif.method, "pty_exited")) {
+            return parsePtyExited(notif.params);
+        } else if (std.mem.eql(u8, notif.method, "cwd_changed")) {
+            try handleCwdChanged(state, notif.params);
+        }
+        return .none;
+    }
+
+    fn parsePtyExited(params: msgpack.Value) ServerAction {
+        if (params != .array or params.array.len < 2) return .none;
+
+        const pty_id = switch (params.array[0]) {
+            .integer => |i| @as(u32, @intCast(i)),
+            .unsigned => |u| @as(u32, @intCast(u)),
+            else => 0,
+        };
+        const status = switch (params.array[1]) {
+            .integer => |i| @as(u32, @intCast(i)),
+            .unsigned => |u| @as(u32, @intCast(u)),
+            else => 0,
+        };
+        return .{ .pty_exited = .{ .pty_id = pty_id, .status = status } };
+    }
+
+    fn handleCwdChanged(state: *ClientState, params: msgpack.Value) !void {
+        if (params != .map) return;
+
+        var pty_id_val: ?msgpack.Value = null;
+        var cwd_val: ?msgpack.Value = null;
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+                pty_id_val = kv.value;
+            } else if (std.mem.eql(u8, kv.key.string, "cwd")) {
+                cwd_val = kv.value;
+            }
+        }
+
+        const pty_id = switch (pty_id_val orelse return) {
+            .integer => |i| @as(i64, @intCast(i)),
+            .unsigned => |u| @as(i64, @intCast(u)),
+            else => return,
+        };
+
+        const cwd = if (cwd_val) |v| (if (v == .string) v.string else null) else null;
+        if (cwd) |cwd_str| {
+            if (state.cwd_map.getPtr(pty_id)) |entry| {
+                state.allocator.free(entry.*);
+            }
+            try state.cwd_map.put(pty_id, try state.allocator.dupe(u8, cwd_str));
+        }
     }
 
     pub fn processPipeMessage(state: *ClientState, value: msgpack.Value) !PipeAction {
