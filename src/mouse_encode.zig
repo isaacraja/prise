@@ -8,6 +8,29 @@ const key_parse = @import("key_parse.zig");
 
 const log = std.log.scoped(.mouse_encode);
 
+const X10_COORD_LIMIT: u16 = 222;
+
+const ButtonCode = struct {
+    const LEFT: u8 = 0;
+    const MIDDLE: u8 = 1;
+    const RIGHT: u8 = 2;
+    const RELEASE: u8 = 3;
+    const MOTION_NO_BUTTON: u8 = 35;
+    const WHEEL_UP: u8 = 64;
+    const WHEEL_DOWN: u8 = 65;
+    const WHEEL_LEFT: u8 = 66;
+    const WHEEL_RIGHT: u8 = 67;
+};
+
+const ModifierMask = struct {
+    const SHIFT: u8 = 4;
+    const ALT: u8 = 8;
+    const CTRL: u8 = 16;
+    const MOTION: u8 = 32;
+};
+
+const X10_OFFSET: u8 = 32;
+
 pub const TerminalState = struct {
     flags: @FieldType(ghostty.Terminal, "flags"),
     modes: ghostty.modes.ModeState,
@@ -79,7 +102,7 @@ pub fn encode(
 
     // Fallback to X10/Normal (max 223 coords)
     // If coordinates are too large for X10, we skip reporting
-    if (col > 222 or row > 222) return;
+    if (col > X10_COORD_LIMIT or row > X10_COORD_LIMIT) return;
 
     try encodeX10(writer, col, row, event);
 }
@@ -89,28 +112,28 @@ fn encodeSGR(writer: anytype, col: u16, row: u16, event: key_parse.MouseEvent) !
 
     // Button mapping
     switch (event.button) {
-        .left => cb = 0,
-        .middle => cb = 1,
-        .right => cb = 2,
-        .wheel_up => cb = 64,
-        .wheel_down => cb = 65,
-        .wheel_left => cb = 66,
-        .wheel_right => cb = 67,
+        .left => cb = ButtonCode.LEFT,
+        .middle => cb = ButtonCode.MIDDLE,
+        .right => cb = ButtonCode.RIGHT,
+        .wheel_up => cb = ButtonCode.WHEEL_UP,
+        .wheel_down => cb = ButtonCode.WHEEL_DOWN,
+        .wheel_left => cb = ButtonCode.WHEEL_LEFT,
+        .wheel_right => cb = ButtonCode.WHEEL_RIGHT,
         .none => if (event.type == .motion) {
-            cb = 35;
+            cb = ButtonCode.MOTION_NO_BUTTON;
         } else {
-            cb = 0;
+            cb = ButtonCode.LEFT;
         },
     }
 
     // Modifiers
-    if (event.mods.shift) cb |= 4;
-    if (event.mods.alt) cb |= 8;
-    if (event.mods.ctrl) cb |= 16;
+    if (event.mods.shift) cb |= ModifierMask.SHIFT;
+    if (event.mods.alt) cb |= ModifierMask.ALT;
+    if (event.mods.ctrl) cb |= ModifierMask.CTRL;
 
     // Drag/Motion
-    if (event.type == .drag) cb |= 32;
-    if (event.type == .motion) cb |= 32;
+    if (event.type == .drag) cb |= ModifierMask.MOTION;
+    if (event.type == .motion) cb |= ModifierMask.MOTION;
 
     // Format: CSI < Cb ; Cx ; Cy M (or m for release)
     const char: u8 = if (event.type == .release) 'm' else 'M';
@@ -121,23 +144,23 @@ fn encodeSGR(writer: anytype, col: u16, row: u16, event: key_parse.MouseEvent) !
 fn encodeX10(writer: anytype, col: u16, row: u16, event: key_parse.MouseEvent) !void {
     var cb: u8 = 0;
     switch (event.button) {
-        .left => cb = 0,
-        .middle => cb = 1,
-        .right => cb = 2,
-        .wheel_up => cb = 64,
-        .wheel_down => cb = 65,
-        .wheel_left => cb = 66,
-        .wheel_right => cb = 67,
-        .none => cb = 0,
+        .left => cb = ButtonCode.LEFT,
+        .middle => cb = ButtonCode.MIDDLE,
+        .right => cb = ButtonCode.RIGHT,
+        .wheel_up => cb = ButtonCode.WHEEL_UP,
+        .wheel_down => cb = ButtonCode.WHEEL_DOWN,
+        .wheel_left => cb = ButtonCode.WHEEL_LEFT,
+        .wheel_right => cb = ButtonCode.WHEEL_RIGHT,
+        .none => cb = ButtonCode.LEFT,
     }
 
-    if (event.type == .release) cb = 3;
-    if (event.type == .drag) cb += 32;
-    if (event.type == .motion) cb += 32;
+    if (event.type == .release) cb = ButtonCode.RELEASE;
+    if (event.type == .drag) cb += ModifierMask.MOTION;
+    if (event.type == .motion) cb += ModifierMask.MOTION;
 
-    if (event.mods.shift) cb |= 4;
-    if (event.mods.alt) cb |= 8;
-    if (event.mods.ctrl) cb |= 16;
+    if (event.mods.shift) cb |= ModifierMask.SHIFT;
+    if (event.mods.alt) cb |= ModifierMask.ALT;
+    if (event.mods.ctrl) cb |= ModifierMask.CTRL;
 
-    try writer.print("\x1b[M{c}{c}{c}", .{ cb + 32, @as(u8, @intCast(col + 1)) + 32, @as(u8, @intCast(row + 1)) + 32 });
+    try writer.print("\x1b[M{c}{c}{c}", .{ cb + X10_OFFSET, @as(u8, @intCast(col + 1)) + X10_OFFSET, @as(u8, @intCast(row + 1)) + X10_OFFSET });
 }

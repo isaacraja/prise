@@ -6,10 +6,12 @@ const root = @import("../io.zig");
 
 const posix = std.posix;
 
+const INITIAL_FD: posix.socket_t = 100;
+
 pub const Loop = struct {
     allocator: std.mem.Allocator,
     next_id: usize = 1,
-    next_fd: posix.socket_t = 100,
+    next_fd: posix.socket_t = INITIAL_FD,
     pending: std.AutoHashMap(usize, PendingOp),
     completions: std.ArrayList(QueuedCompletion),
 

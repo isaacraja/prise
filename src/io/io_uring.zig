@@ -9,6 +9,9 @@ const posix = std.posix;
 
 const log = std.log.scoped(.io_uring);
 
+const RING_ENTRIES: u13 = 256;
+const CQE_BATCH_SIZE: usize = 32;
+
 pub const Loop = struct {
     allocator: std.mem.Allocator,
     ring: linux.IoUring,
@@ -35,7 +38,7 @@ pub const Loop = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) !Loop {
-        const ring = try linux.IoUring.init(256, 0);
+        const ring = try linux.IoUring.init(RING_ENTRIES, 0);
         return .{
             .allocator = allocator,
             .ring = ring,
@@ -246,7 +249,7 @@ pub const Loop = struct {
     }
 
     pub fn run(self: *Loop, mode: RunMode) !void {
-        var cqes: [32]linux.io_uring_cqe = undefined;
+        var cqes: [CQE_BATCH_SIZE]linux.io_uring_cqe = undefined;
 
         while (true) {
             if (mode == .until_done and self.pending.count() == 0) break;

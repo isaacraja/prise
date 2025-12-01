@@ -7,6 +7,8 @@ const root = @import("../io.zig");
 const c = std.c;
 const posix = std.posix;
 
+const EVENT_BATCH_SIZE: usize = 32;
+
 pub const Loop = struct {
     allocator: std.mem.Allocator,
     kq: i32,
@@ -354,7 +356,7 @@ pub const Loop = struct {
     }
 
     pub fn run(self: *Loop, mode: RunMode) !void {
-        var events: [32]posix.Kevent = undefined;
+        var events: [EVENT_BATCH_SIZE]posix.Kevent = undefined;
 
         while (true) {
             if (mode == .until_done and self.pending.count() == 0) {

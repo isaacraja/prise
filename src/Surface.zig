@@ -11,6 +11,8 @@ const log = std.log.scoped(.surface);
 
 const Surface = @This();
 
+const SELECTION_BG_COLOR: [3]u8 = .{ 0x26, 0x4f, 0x78 };
+
 front: *vaxis.AllocatingScreen,
 back: *vaxis.AllocatingScreen,
 allocator: std.mem.Allocator,
@@ -558,7 +560,7 @@ pub fn render(self: *const Surface, win: vaxis.Window, focused: bool, terminal_c
             var cell = self.front.readCell(@intCast(col), @intCast(row)) orelse continue;
 
             if (self.isCellSelected(@intCast(row), @intCast(col))) {
-                cell.style.bg = .{ .rgb = .{ 0x26, 0x4f, 0x78 } };
+                cell.style.bg = .{ .rgb = SELECTION_BG_COLOR };
             }
 
             if (dim_factor > 0.0) {

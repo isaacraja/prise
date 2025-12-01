@@ -5,6 +5,73 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
+const Format = struct {
+    const POSITIVE_FIXINT_MAX: u8 = 0x7f;
+    const NEGATIVE_FIXINT_MIN: u8 = 0xe0;
+    const FIXSTR_PREFIX: u8 = 0xa0;
+    const FIXSTR_MASK: u8 = 0x1f;
+    const FIXARRAY_PREFIX: u8 = 0x90;
+    const FIXARRAY_MASK: u8 = 0x0f;
+    const FIXMAP_PREFIX: u8 = 0x80;
+    const FIXMAP_MASK: u8 = 0x0f;
+
+    const NIL: u8 = 0xc0;
+    const FALSE: u8 = 0xc2;
+    const TRUE: u8 = 0xc3;
+
+    const BIN8: u8 = 0xc4;
+    const BIN16: u8 = 0xc5;
+    const BIN32: u8 = 0xc6;
+
+    const EXT8: u8 = 0xc7;
+    const EXT16: u8 = 0xc8;
+    const EXT32: u8 = 0xc9;
+    const FLOAT32: u8 = 0xca;
+    const FLOAT64: u8 = 0xcb;
+
+    const UINT8: u8 = 0xcc;
+    const UINT16: u8 = 0xcd;
+    const UINT32: u8 = 0xce;
+    const UINT64: u8 = 0xcf;
+
+    const INT8: u8 = 0xd0;
+    const INT16: u8 = 0xd1;
+    const INT32: u8 = 0xd2;
+    const INT64: u8 = 0xd3;
+
+    const FIXEXT1: u8 = 0xd4;
+    const FIXEXT2: u8 = 0xd5;
+    const FIXEXT4: u8 = 0xd6;
+    const FIXEXT8: u8 = 0xd7;
+    const FIXEXT16: u8 = 0xd8;
+
+    const STR8: u8 = 0xd9;
+    const STR16: u8 = 0xda;
+    const STR32: u8 = 0xdb;
+
+    const ARRAY16: u8 = 0xdc;
+    const ARRAY32: u8 = 0xdd;
+
+    const MAP16: u8 = 0xde;
+    const MAP32: u8 = 0xdf;
+};
+
+const Limits = struct {
+    const FIXINT_MAX: i64 = 0x7f;
+    const NEGATIVE_FIXINT_MIN: i64 = -32;
+    const INT8_MIN: i64 = -128;
+    const INT16_MIN: i64 = -32768;
+    const INT32_MIN: i64 = -2147483648;
+
+    const UINT8_MAX: u64 = 0xff;
+    const UINT16_MAX: u64 = 0xffff;
+    const UINT32_MAX: u64 = 0xffffffff;
+
+    const FIXSTR_MAX: usize = 31;
+    const FIXARRAY_MAX: usize = 15;
+    const FIXMAP_MAX: usize = 15;
+};
+
 pub const EncodeError = error{
     OutOfMemory,
     IntegerTooLarge,
@@ -46,17 +113,17 @@ fn encodeValueType(allocator: Allocator, buf: *std.ArrayList(u8), value: Value) 
         .binary => |b| try encodeString(allocator, buf, b),
         .array => |arr| {
             const len = arr.len;
-            if (len > 0xffffffff) return error.ArrayTooLong;
+            if (len > Limits.UINT32_MAX) return error.ArrayTooLong;
 
-            if (len <= 15) {
-                try buf.append(allocator, 0x90 | @as(u8, @intCast(len)));
-            } else if (len <= 0xffff) {
-                try buf.append(allocator, 0xdc);
+            if (len <= Limits.FIXARRAY_MAX) {
+                try buf.append(allocator, Format.FIXARRAY_PREFIX | @as(u8, @intCast(len)));
+            } else if (len <= Limits.UINT16_MAX) {
+                try buf.append(allocator, Format.ARRAY16);
                 const bytes = std.mem.toBytes(@as(u16, @intCast(len)));
                 try buf.append(allocator, bytes[1]);
                 try buf.append(allocator, bytes[0]);
             } else {
-                try buf.append(allocator, 0xdd);
+                try buf.append(allocator, Format.ARRAY32);
                 const bytes = std.mem.toBytes(@as(u32, @intCast(len)));
                 try buf.append(allocator, bytes[3]);
                 try buf.append(allocator, bytes[2]);
@@ -70,17 +137,17 @@ fn encodeValueType(allocator: Allocator, buf: *std.ArrayList(u8), value: Value) 
         },
         .map => |m| {
             const len = m.len;
-            if (len > 0xffffffff) return error.MapTooLong;
+            if (len > Limits.UINT32_MAX) return error.MapTooLong;
 
-            if (len <= 15) {
-                try buf.append(allocator, 0x80 | @as(u8, @intCast(len)));
-            } else if (len <= 0xffff) {
-                try buf.append(allocator, 0xde);
+            if (len <= Limits.FIXMAP_MAX) {
+                try buf.append(allocator, Format.FIXMAP_PREFIX | @as(u8, @intCast(len)));
+            } else if (len <= Limits.UINT16_MAX) {
+                try buf.append(allocator, Format.MAP16);
                 const bytes = std.mem.toBytes(@as(u16, @intCast(len)));
                 try buf.append(allocator, bytes[1]);
                 try buf.append(allocator, bytes[0]);
             } else {
-                try buf.append(allocator, 0xdf);
+                try buf.append(allocator, Format.MAP32);
                 const bytes = std.mem.toBytes(@as(u32, @intCast(len)));
                 try buf.append(allocator, bytes[3]);
                 try buf.append(allocator, bytes[2]);
@@ -157,11 +224,11 @@ fn encodeValue(allocator: Allocator, buf: *std.ArrayList(u8), value: anytype) En
 }
 
 fn encodeNil(allocator: Allocator, buf: *std.ArrayList(u8)) !void {
-    try buf.append(allocator, 0xc0);
+    try buf.append(allocator, Format.NIL);
 }
 
 fn encodeBool(allocator: Allocator, buf: *std.ArrayList(u8), value: bool) !void {
-    try buf.append(allocator, if (value) 0xc3 else 0xc2);
+    try buf.append(allocator, if (value) Format.TRUE else Format.FALSE);
 }
 
 fn encodeInt(allocator: Allocator, buf: *std.ArrayList(u8), value: anytype) !void {
@@ -169,25 +236,25 @@ fn encodeInt(allocator: Allocator, buf: *std.ArrayList(u8), value: anytype) !voi
 
     if (val >= 0) {
         const uval: u64 = @intCast(val);
-        if (uval <= 0x7f) {
+        if (uval <= Limits.FIXINT_MAX) {
             try buf.append(allocator, @intCast(uval));
-        } else if (uval <= 0xff) {
-            try buf.append(allocator, 0xcc);
+        } else if (uval <= Limits.UINT8_MAX) {
+            try buf.append(allocator, Format.UINT8);
             try buf.append(allocator, @intCast(uval));
-        } else if (uval <= 0xffff) {
-            try buf.append(allocator, 0xcd);
+        } else if (uval <= Limits.UINT16_MAX) {
+            try buf.append(allocator, Format.UINT16);
             const bytes = std.mem.toBytes(@as(u16, @intCast(uval)));
             try buf.append(allocator, bytes[1]);
             try buf.append(allocator, bytes[0]);
-        } else if (uval <= 0xffffffff) {
-            try buf.append(allocator, 0xce);
+        } else if (uval <= Limits.UINT32_MAX) {
+            try buf.append(allocator, Format.UINT32);
             const bytes = std.mem.toBytes(@as(u32, @intCast(uval)));
             try buf.append(allocator, bytes[3]);
             try buf.append(allocator, bytes[2]);
             try buf.append(allocator, bytes[1]);
             try buf.append(allocator, bytes[0]);
         } else {
-            try buf.append(allocator, 0xcf);
+            try buf.append(allocator, Format.UINT64);
             const bytes = std.mem.toBytes(uval);
             try buf.append(allocator, bytes[7]);
             try buf.append(allocator, bytes[6]);
@@ -199,25 +266,25 @@ fn encodeInt(allocator: Allocator, buf: *std.ArrayList(u8), value: anytype) !voi
             try buf.append(allocator, bytes[0]);
         }
     } else {
-        if (val >= -32) {
+        if (val >= Limits.NEGATIVE_FIXINT_MIN) {
             try buf.append(allocator, @bitCast(@as(i8, @intCast(val))));
-        } else if (val >= -128) {
-            try buf.append(allocator, 0xd0);
+        } else if (val >= Limits.INT8_MIN) {
+            try buf.append(allocator, Format.INT8);
             try buf.append(allocator, @bitCast(@as(i8, @intCast(val))));
-        } else if (val >= -32768) {
-            try buf.append(allocator, 0xd1);
+        } else if (val >= Limits.INT16_MIN) {
+            try buf.append(allocator, Format.INT16);
             const bytes = std.mem.toBytes(@as(i16, @intCast(val)));
             try buf.append(allocator, bytes[1]);
             try buf.append(allocator, bytes[0]);
-        } else if (val >= -2147483648) {
-            try buf.append(allocator, 0xd2);
+        } else if (val >= Limits.INT32_MIN) {
+            try buf.append(allocator, Format.INT32);
             const bytes = std.mem.toBytes(@as(i32, @intCast(val)));
             try buf.append(allocator, bytes[3]);
             try buf.append(allocator, bytes[2]);
             try buf.append(allocator, bytes[1]);
             try buf.append(allocator, bytes[0]);
         } else {
-            try buf.append(allocator, 0xd3);
+            try buf.append(allocator, Format.INT64);
             const bytes = std.mem.toBytes(val);
             try buf.append(allocator, bytes[7]);
             try buf.append(allocator, bytes[6]);
@@ -233,7 +300,7 @@ fn encodeInt(allocator: Allocator, buf: *std.ArrayList(u8), value: anytype) !voi
 
 fn encodeFloat(allocator: Allocator, buf: *std.ArrayList(u8), value: anytype) !void {
     const val: f64 = @floatCast(value);
-    try buf.append(allocator, 0xcb);
+    try buf.append(allocator, Format.FLOAT64);
     const bytes = std.mem.toBytes(@as(u64, @bitCast(val)));
     try buf.append(allocator, bytes[7]);
     try buf.append(allocator, bytes[6]);
@@ -247,20 +314,20 @@ fn encodeFloat(allocator: Allocator, buf: *std.ArrayList(u8), value: anytype) !v
 
 fn encodeString(allocator: Allocator, buf: *std.ArrayList(u8), value: []const u8) !void {
     const len = value.len;
-    if (len > 0xffffffff) return error.StringTooLong;
+    if (len > Limits.UINT32_MAX) return error.StringTooLong;
 
-    if (len <= 31) {
-        try buf.append(allocator, 0xa0 | @as(u8, @intCast(len)));
-    } else if (len <= 0xff) {
-        try buf.append(allocator, 0xd9);
+    if (len <= Limits.FIXSTR_MAX) {
+        try buf.append(allocator, Format.FIXSTR_PREFIX | @as(u8, @intCast(len)));
+    } else if (len <= Limits.UINT8_MAX) {
+        try buf.append(allocator, Format.STR8);
         try buf.append(allocator, @intCast(len));
-    } else if (len <= 0xffff) {
-        try buf.append(allocator, 0xda);
+    } else if (len <= Limits.UINT16_MAX) {
+        try buf.append(allocator, Format.STR16);
         const bytes = std.mem.toBytes(@as(u16, @intCast(len)));
         try buf.append(allocator, bytes[1]);
         try buf.append(allocator, bytes[0]);
     } else {
-        try buf.append(allocator, 0xdb);
+        try buf.append(allocator, Format.STR32);
         const bytes = std.mem.toBytes(@as(u32, @intCast(len)));
         try buf.append(allocator, bytes[3]);
         try buf.append(allocator, bytes[2]);
@@ -272,17 +339,17 @@ fn encodeString(allocator: Allocator, buf: *std.ArrayList(u8), value: []const u8
 
 fn encodeArray(allocator: Allocator, buf: *std.ArrayList(u8), value: anytype) !void {
     const len = value.len;
-    if (len > 0xffffffff) return error.ArrayTooLong;
+    if (len > Limits.UINT32_MAX) return error.ArrayTooLong;
 
-    if (len <= 15) {
-        try buf.append(allocator, 0x90 | @as(u8, @intCast(len)));
-    } else if (len <= 0xffff) {
-        try buf.append(allocator, 0xdc);
+    if (len <= Limits.FIXARRAY_MAX) {
+        try buf.append(allocator, Format.FIXARRAY_PREFIX | @as(u8, @intCast(len)));
+    } else if (len <= Limits.UINT16_MAX) {
+        try buf.append(allocator, Format.ARRAY16);
         const bytes = std.mem.toBytes(@as(u16, @intCast(len)));
         try buf.append(allocator, bytes[1]);
         try buf.append(allocator, bytes[0]);
     } else {
-        try buf.append(allocator, 0xdd);
+        try buf.append(allocator, Format.ARRAY32);
         const bytes = std.mem.toBytes(@as(u32, @intCast(len)));
         try buf.append(allocator, bytes[3]);
         try buf.append(allocator, bytes[2]);
@@ -436,72 +503,72 @@ pub const Decoder = struct {
         const byte = self.data[self.pos];
         self.pos += 1;
 
-        if (byte <= 0x7f) {
+        if (byte <= Format.POSITIVE_FIXINT_MAX) {
             return .{ .unsigned = byte };
-        } else if (byte >= 0xe0) {
+        } else if (byte >= Format.NEGATIVE_FIXINT_MIN) {
             return .{ .integer = @as(i8, @bitCast(byte)) };
-        } else if (byte >= 0xa0 and byte <= 0xbf) {
-            const len = byte & 0x1f;
+        } else if (byte >= Format.FIXSTR_PREFIX and byte <= Format.FIXSTR_PREFIX + Format.FIXSTR_MASK) {
+            const len = byte & Format.FIXSTR_MASK;
             return try self.decodeStringWithLen(len);
-        } else if (byte >= 0x90 and byte <= 0x9f) {
-            const len = byte & 0x0f;
+        } else if (byte >= Format.FIXARRAY_PREFIX and byte <= Format.FIXARRAY_PREFIX + Format.FIXARRAY_MASK) {
+            const len = byte & Format.FIXARRAY_MASK;
             return try self.decodeArrayWithLen(len);
-        } else if (byte >= 0x80 and byte <= 0x8f) {
-            const len = byte & 0x0f;
+        } else if (byte >= Format.FIXMAP_PREFIX and byte <= Format.FIXMAP_PREFIX + Format.FIXMAP_MASK) {
+            const len = byte & Format.FIXMAP_MASK;
             return try self.decodeMapWithLen(len);
         }
 
         return switch (byte) {
-            0xc0 => .nil,
-            0xc2 => .{ .boolean = false },
-            0xc3 => .{ .boolean = true },
-            0xcc => .{ .unsigned = try self.readByte() },
-            0xcd => .{ .unsigned = try self.readU16() },
-            0xce => .{ .unsigned = try self.readU32() },
-            0xcf => .{ .unsigned = try self.readU64() },
-            0xd0 => .{ .integer = try self.readI8() },
-            0xd1 => .{ .integer = try self.readI16() },
-            0xd2 => .{ .integer = try self.readI32() },
-            0xd3 => .{ .integer = try self.readI64() },
-            0xca => .{ .float = @floatCast(try self.readF32()) },
-            0xcb => .{ .float = try self.readF64() },
-            0xd9 => blk: {
+            Format.NIL => .nil,
+            Format.FALSE => .{ .boolean = false },
+            Format.TRUE => .{ .boolean = true },
+            Format.UINT8 => .{ .unsigned = try self.readByte() },
+            Format.UINT16 => .{ .unsigned = try self.readU16() },
+            Format.UINT32 => .{ .unsigned = try self.readU32() },
+            Format.UINT64 => .{ .unsigned = try self.readU64() },
+            Format.INT8 => .{ .integer = try self.readI8() },
+            Format.INT16 => .{ .integer = try self.readI16() },
+            Format.INT32 => .{ .integer = try self.readI32() },
+            Format.INT64 => .{ .integer = try self.readI64() },
+            Format.FLOAT32 => .{ .float = @floatCast(try self.readF32()) },
+            Format.FLOAT64 => .{ .float = try self.readF64() },
+            Format.STR8 => blk: {
                 const len = try self.readByte();
                 break :blk try self.decodeStringWithLen(len);
             },
-            0xda => blk: {
+            Format.STR16 => blk: {
                 const len = try self.readU16();
                 break :blk try self.decodeStringWithLen(len);
             },
-            0xdb => blk: {
+            Format.STR32 => blk: {
                 const len = try self.readU32();
                 break :blk try self.decodeStringWithLen(len);
             },
-            0xc4 => blk: {
+            Format.BIN8 => blk: {
                 const len = try self.readByte();
                 break :blk try self.decodeBinaryWithLen(len);
             },
-            0xc5 => blk: {
+            Format.BIN16 => blk: {
                 const len = try self.readU16();
                 break :blk try self.decodeBinaryWithLen(len);
             },
-            0xc6 => blk: {
+            Format.BIN32 => blk: {
                 const len = try self.readU32();
                 break :blk try self.decodeBinaryWithLen(len);
             },
-            0xdc => blk: {
+            Format.ARRAY16 => blk: {
                 const len = try self.readU16();
                 break :blk try self.decodeArrayWithLen(len);
             },
-            0xdd => blk: {
+            Format.ARRAY32 => blk: {
                 const len = try self.readU32();
                 break :blk try self.decodeArrayWithLen(len);
             },
-            0xde => blk: {
+            Format.MAP16 => blk: {
                 const len = try self.readU16();
                 break :blk try self.decodeMapWithLen(len);
             },
-            0xdf => blk: {
+            Format.MAP32 => blk: {
                 const len = try self.readU32();
                 break :blk try self.decodeMapWithLen(len);
             },
@@ -673,8 +740,8 @@ pub const Decoder = struct {
         const byte = self.data[self.pos];
         self.pos += 1;
 
-        if (byte <= 0x7f or byte >= 0xe0) return;
-        if (byte == 0xc0 or byte == 0xc2 or byte == 0xc3) return;
+        if (byte <= Format.POSITIVE_FIXINT_MAX or byte >= Format.NEGATIVE_FIXINT_MIN) return;
+        if (byte == Format.NIL or byte == Format.FALSE or byte == Format.TRUE) return;
 
         if (self.skipFixedSize(byte)) |_| return;
         if (try self.skipStringOrBinary(byte)) return;
@@ -687,11 +754,11 @@ pub const Decoder = struct {
 
     fn skipFixedSize(self: *Decoder, byte: u8) ?void {
         const size: usize = switch (byte) {
-            0xcc, 0xd0, 0xd4 => 1,
-            0xcd, 0xd1, 0xd5 => 2,
-            0xce, 0xd2, 0xca, 0xd6 => 4,
-            0xcf, 0xd3, 0xcb, 0xd7 => 8,
-            0xd8 => 16,
+            Format.UINT8, Format.INT8, Format.FIXEXT1 => 1,
+            Format.UINT16, Format.INT16, Format.FIXEXT2 => 2,
+            Format.UINT32, Format.INT32, Format.FLOAT32, Format.FIXEXT4 => 4,
+            Format.UINT64, Format.INT64, Format.FLOAT64, Format.FIXEXT8 => 8,
+            Format.FIXEXT16 => 16,
             else => return null,
         };
         self.pos += size;
@@ -699,20 +766,20 @@ pub const Decoder = struct {
     }
 
     fn skipStringOrBinary(self: *Decoder, byte: u8) DecodeError!bool {
-        if (byte >= 0xa0 and byte <= 0xbf) {
-            self.pos += byte & 0x1f;
+        if (byte >= Format.FIXSTR_PREFIX and byte <= Format.FIXSTR_PREFIX + Format.FIXSTR_MASK) {
+            self.pos += byte & Format.FIXSTR_MASK;
             return true;
         }
 
         const len: usize = switch (byte) {
-            0xd9, 0xc4 => blk: {
+            Format.STR8, Format.BIN8 => blk: {
                 if (self.pos >= self.data.len) return error.UnexpectedEndOfInput;
                 const l = self.data[self.pos];
                 self.pos += 1;
                 break :blk l;
             },
-            0xda, 0xc5 => try self.readU16(),
-            0xdb, 0xc6 => try self.readU32(),
+            Format.STR16, Format.BIN16 => try self.readU16(),
+            Format.STR32, Format.BIN32 => try self.readU32(),
             else => return false,
         };
         self.pos += len;
@@ -721,14 +788,14 @@ pub const Decoder = struct {
 
     fn skipExtension(self: *Decoder, byte: u8) DecodeError!bool {
         const len: usize = switch (byte) {
-            0xc7 => blk: {
+            Format.EXT8 => blk: {
                 if (self.pos >= self.data.len) return error.UnexpectedEndOfInput;
                 const l = self.data[self.pos];
                 self.pos += 1;
                 break :blk l;
             },
-            0xc8 => try self.readU16(),
-            0xc9 => try self.readU32(),
+            Format.EXT16 => try self.readU16(),
+            Format.EXT32 => try self.readU32(),
             else => return false,
         };
         self.pos += 1; // type byte
@@ -737,11 +804,11 @@ pub const Decoder = struct {
     }
 
     fn skipArray(self: *Decoder, byte: u8) DecodeError!bool {
-        const len: usize = if (byte >= 0x90 and byte <= 0x9f)
-            byte & 0x0f
+        const len: usize = if (byte >= Format.FIXARRAY_PREFIX and byte <= Format.FIXARRAY_PREFIX + Format.FIXARRAY_MASK)
+            byte & Format.FIXARRAY_MASK
         else switch (byte) {
-            0xdc => try self.readU16(),
-            0xdd => try self.readU32(),
+            Format.ARRAY16 => try self.readU16(),
+            Format.ARRAY32 => try self.readU32(),
             else => return false,
         };
 
@@ -750,11 +817,11 @@ pub const Decoder = struct {
     }
 
     fn skipMap(self: *Decoder, byte: u8) DecodeError!bool {
-        const len: usize = if (byte >= 0x80 and byte <= 0x8f)
-            byte & 0x0f
+        const len: usize = if (byte >= Format.FIXMAP_PREFIX and byte <= Format.FIXMAP_PREFIX + Format.FIXMAP_MASK)
+            byte & Format.FIXMAP_MASK
         else switch (byte) {
-            0xde => try self.readU16(),
-            0xdf => try self.readU32(),
+            Format.MAP16 => try self.readU16(),
+            Format.MAP32 => try self.readU32(),
             else => return false,
         };
 
@@ -768,30 +835,32 @@ pub const Decoder = struct {
     }
 
     pub fn isMap(byte: u8) bool {
-        return (byte >= 0x80 and byte <= 0x8f) or byte == 0xde or byte == 0xdf;
+        return (byte >= Format.FIXMAP_PREFIX and byte <= Format.FIXMAP_PREFIX + Format.FIXMAP_MASK) or
+            byte == Format.MAP16 or byte == Format.MAP32;
     }
 
     pub fn isArray(byte: u8) bool {
-        return (byte >= 0x90 and byte <= 0x9f) or byte == 0xdc or byte == 0xdd;
+        return (byte >= Format.FIXARRAY_PREFIX and byte <= Format.FIXARRAY_PREFIX + Format.FIXARRAY_MASK) or
+            byte == Format.ARRAY16 or byte == Format.ARRAY32;
     }
 
     pub fn readInt(self: *Decoder) !i64 {
         const byte = try self.readByte();
-        if (byte <= 0x7f) {
+        if (byte <= Format.POSITIVE_FIXINT_MAX) {
             return @intCast(byte);
-        } else if (byte >= 0xe0) {
+        } else if (byte >= Format.NEGATIVE_FIXINT_MIN) {
             return @intCast(@as(i8, @bitCast(byte)));
         }
 
         return switch (byte) {
-            0xcc => @intCast(try self.readByte()),
-            0xcd => @intCast(try self.readU16()),
-            0xce => @intCast(try self.readU32()),
-            0xcf => @intCast(try self.readU64()), // Might overflow i64 if huge unsigned
-            0xd0 => @intCast(try self.readI8()),
-            0xd1 => @intCast(try self.readI16()),
-            0xd2 => @intCast(try self.readI32()),
-            0xd3 => try self.readI64(),
+            Format.UINT8 => @intCast(try self.readByte()),
+            Format.UINT16 => @intCast(try self.readU16()),
+            Format.UINT32 => @intCast(try self.readU32()),
+            Format.UINT64 => @intCast(try self.readU64()),
+            Format.INT8 => @intCast(try self.readI8()),
+            Format.INT16 => @intCast(try self.readI16()),
+            Format.INT32 => @intCast(try self.readI32()),
+            Format.INT64 => try self.readI64(),
             else => error.InvalidFormat,
         };
     }
@@ -799,8 +868,8 @@ pub const Decoder = struct {
     pub fn readFloat(self: *Decoder) !f64 {
         const byte = try self.readByte();
         return switch (byte) {
-            0xca => @floatCast(try self.readF32()),
-            0xcb => try self.readF64(),
+            Format.FLOAT32 => @floatCast(try self.readF32()),
+            Format.FLOAT64 => try self.readF64(),
             else => error.InvalidFormat,
         };
     }
@@ -808,13 +877,13 @@ pub const Decoder = struct {
     pub fn readString(self: *Decoder) ![]u8 {
         const byte = try self.readByte();
         var len: u64 = 0;
-        if (byte >= 0xa0 and byte <= 0xbf) {
-            len = byte & 0x1f;
-        } else if (byte == 0xd9) {
+        if (byte >= Format.FIXSTR_PREFIX and byte <= Format.FIXSTR_PREFIX + Format.FIXSTR_MASK) {
+            len = byte & Format.FIXSTR_MASK;
+        } else if (byte == Format.STR8) {
             len = try self.readByte();
-        } else if (byte == 0xda) {
+        } else if (byte == Format.STR16) {
             len = try self.readU16();
-        } else if (byte == 0xdb) {
+        } else if (byte == Format.STR32) {
             len = try self.readU32();
         } else {
             return error.InvalidFormat;
@@ -826,11 +895,11 @@ pub const Decoder = struct {
 
     pub fn readArrayLen(self: *Decoder) !usize {
         const byte = try self.readByte();
-        if (byte >= 0x90 and byte <= 0x9f) {
-            return byte & 0x0f;
-        } else if (byte == 0xdc) {
+        if (byte >= Format.FIXARRAY_PREFIX and byte <= Format.FIXARRAY_PREFIX + Format.FIXARRAY_MASK) {
+            return byte & Format.FIXARRAY_MASK;
+        } else if (byte == Format.ARRAY16) {
             return try self.readU16();
-        } else if (byte == 0xdd) {
+        } else if (byte == Format.ARRAY32) {
             return try self.readU32();
         }
         return error.InvalidFormat;
@@ -838,11 +907,11 @@ pub const Decoder = struct {
 
     pub fn readMapLen(self: *Decoder) !usize {
         const byte = try self.readByte();
-        if (byte >= 0x80 and byte <= 0x8f) {
-            return byte & 0x0f;
-        } else if (byte == 0xde) {
+        if (byte >= Format.FIXMAP_PREFIX and byte <= Format.FIXMAP_PREFIX + Format.FIXMAP_MASK) {
+            return byte & Format.FIXMAP_MASK;
+        } else if (byte == Format.MAP16) {
             return try self.readU16();
-        } else if (byte == 0xdf) {
+        } else if (byte == Format.MAP32) {
             return try self.readU32();
         }
         return error.InvalidFormat;
