@@ -364,15 +364,15 @@ end
 ---Serialize a node tree to a table with pty_ids instead of userdata
 ---@param node? Node
 ---@return table?
-local function serialize_node(node, pwd_lookup)
+local function serialize_node(node, cwd_lookup)
     if not node then
         return nil
     end
     if is_pane(node) then
         local pty_id = node.pty:id()
         local cwd = nil
-        if pwd_lookup then
-            cwd = pwd_lookup(pty_id)
+        if cwd_lookup then
+            cwd = cwd_lookup(pty_id)
         end
         return {
             type = "pane",
@@ -384,7 +384,7 @@ local function serialize_node(node, pwd_lookup)
     elseif is_split(node) then
         local children = {}
         for _, child in ipairs(node.children) do
-            table.insert(children, serialize_node(child, pwd_lookup))
+            table.insert(children, serialize_node(child, cwd_lookup))
         end
         return {
             type = "split",
@@ -572,15 +572,17 @@ local commands = {
     {
         name = "Split Horizontal",
         action = function()
+            local pty = get_focused_pty()
             state.pending_split = { direction = "row" }
-            prise.spawn({})
+            prise.spawn({ cwd = pty and pty:cwd() })
         end,
     },
     {
         name = "Split Vertical",
         action = function()
+            local pty = get_focused_pty()
             state.pending_split = { direction = "col" }
-            prise.spawn({})
+            prise.spawn({ cwd = pty and pty:cwd() })
         end,
     },
     {
@@ -594,7 +596,7 @@ local commands = {
                 else
                     state.pending_split = { direction = "col" }
                 end
-                prise.spawn({})
+                prise.spawn({ cwd = pty:cwd() })
             end
         end,
     },
@@ -814,13 +816,15 @@ function M.update(event)
                 handled = true
             elseif k == "%" or k == "v" then
                 -- Split horizontal (side-by-side)
-                prise.spawn({})
+                local pty = get_focused_pty()
                 state.pending_split = { direction = "row" }
+                prise.spawn({ cwd = pty and pty:cwd() })
                 handled = true
             elseif k == '"' or k == "'" or k == "s" then
                 -- Split vertical (top-bottom)
-                prise.spawn({})
+                local pty = get_focused_pty()
                 state.pending_split = { direction = "col" }
+                prise.spawn({ cwd = pty and pty:cwd() })
                 handled = true
             elseif k == "d" then
                 -- Detach from session
@@ -850,7 +854,7 @@ function M.update(event)
                     else
                         state.pending_split = { direction = "col" }
                     end
-                    prise.spawn({})
+                    prise.spawn({ cwd = pty:cwd() })
                     handled = true
                 end
             end
@@ -1171,9 +1175,9 @@ function M.view()
 end
 
 ---@return table
-function M.get_state(pwd_lookup)
+function M.get_state(cwd_lookup)
     return {
-        root = serialize_node(state.root, pwd_lookup),
+        root = serialize_node(state.root, cwd_lookup),
         focused_id = state.focused_id,
         next_split_id = state.next_split_id,
     }

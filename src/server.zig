@@ -31,7 +31,7 @@ pub const LIMITS = struct {
     pub const MESSAGE_SIZE_MAX: usize = 16 * 1024 * 1024; // 16MB
     pub const SEND_QUEUE_MAX: usize = 1024;
     pub const TITLE_LEN_MAX: usize = 4096;
-    pub const PWD_LEN_MAX: usize = 4096; // typical PATH_MAX
+    pub const CWD_LEN_MAX: usize = 4096; // typical PATH_MAX
 };
 
 var signal_write_fd: posix.fd_t = undefined;
@@ -81,8 +81,8 @@ const Pty = struct {
     title_dirty: bool = false,
 
     // Current working directory (from OSC 7)
-    pwd: std.ArrayList(u8),
-    pwd_dirty: bool = false,
+    cwd: std.ArrayList(u8),
+    cwd_dirty: bool = false,
 
     // Exit state
     exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -142,8 +142,8 @@ const Pty = struct {
             .allocator = allocator,
             .title = std.ArrayList(u8).empty,
             .title_dirty = false,
-            .pwd = std.ArrayList(u8).empty,
-            .pwd_dirty = false,
+            .cwd = std.ArrayList(u8).empty,
+            .cwd_dirty = false,
             .pipe_fds = pipe_fds,
             .exit_pipe_fds = exit_pipe_fds,
             .render_state = .empty,
@@ -197,7 +197,7 @@ const Pty = struct {
         self.render_state.deinit(allocator);
         self.clients.deinit(allocator);
         self.title.deinit(allocator);
-        self.pwd.deinit(allocator);
+        self.cwd.deinit(allocator);
         allocator.destroy(self);
     }
 
@@ -248,13 +248,13 @@ const Pty = struct {
         self.title_dirty = true;
     }
 
-    fn setPwd(self: *Pty, pwd: []const u8) !void {
+    fn setCwd(self: *Pty, cwd: []const u8) !void {
         // Mutex is already held by readThread when this is called via callback
-        const truncated = if (pwd.len > LIMITS.PWD_LEN_MAX) pwd[0..LIMITS.PWD_LEN_MAX] else pwd;
+        const truncated = if (cwd.len > LIMITS.CWD_LEN_MAX) cwd[0..LIMITS.CWD_LEN_MAX] else cwd;
 
-        self.pwd.clearRetainingCapacity();
-        try self.pwd.appendSlice(self.allocator, truncated);
-        self.pwd_dirty = true;
+        self.cwd.clearRetainingCapacity();
+        try self.cwd.appendSlice(self.allocator, truncated);
+        self.cwd_dirty = true;
     }
 
     // Removed broadcast - we'll send msgpack-RPC redraw notifications instead
@@ -295,15 +295,15 @@ const Pty = struct {
             }
         }.onTitle);
 
-        // Set up pwd callback (OSC 7)
-        handler.setPwdCallback(self, struct {
-            fn onPwd(ctx: ?*anyopaque, pwd: []const u8) !void {
+        // Set up cwd callback (OSC 7)
+        handler.setCwdCallback(self, struct {
+            fn onCwd(ctx: ?*anyopaque, cwd: []const u8) !void {
                 const pty_inst: *Pty = @ptrCast(@alignCast(ctx));
-                pty_inst.setPwd(pwd) catch |err| {
-                    log.err("Failed to set pwd: {}", .{err});
+                pty_inst.setCwd(cwd) catch |err| {
+                    log.err("Failed to set cwd: {}", .{err});
                 };
             }
-        }.onPwd);
+        }.onCwd);
 
         var stream = vt_handler.Stream.initAlloc(self.allocator, handler);
         defer stream.deinit();
@@ -1795,6 +1795,7 @@ const Server = struct {
         });
 
         if (parsed.attach) {
+            try pty_instance.addClient(self.allocator, client);
             try client.attached_sessions.append(self.allocator, pty_id);
 
             log.info("Sending initial redraw for PTY {}", .{pty_id});
@@ -2256,11 +2257,11 @@ const Server = struct {
             std.log.err("Failed to send redraw for session {}: {}", .{ pty_instance.id, err });
         };
 
-        // Send pwd_changed notification if pwd is dirty
-        if (pty_instance.pwd_dirty) {
-            pty_instance.pwd_dirty = false;
-            self.sendPwdChanged(pty_instance) catch |err| {
-                std.log.err("Failed to send pwd_changed for pty {}: {}", .{ pty_instance.id, err });
+        // Send cwd_changed notification if cwd is dirty
+        if (pty_instance.cwd_dirty) {
+            pty_instance.cwd_dirty = false;
+            self.sendCwdChanged(pty_instance) catch |err| {
+                std.log.err("Failed to send cwd_changed for pty {}: {}", .{ pty_instance.id, err });
             };
         }
 
@@ -2282,17 +2283,32 @@ const Server = struct {
         }
     }
 
-    fn sendPwdChanged(self: *Server, pty_instance: *Pty) !void {
-        if (pty_instance.pwd.items.len == 0) return;
+    fn sendCwdChanged(self: *Server, pty_instance: *Pty) !void {
+        if (pty_instance.cwd.items.len == 0) return;
 
-        const params = .{ pty_instance.id, pty_instance.pwd.items };
-        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "pwd_changed", params });
+        var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 2);
+        defer self.allocator.free(map_items);
+        map_items[0] = .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = pty_instance.id } };
+        map_items[1] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = pty_instance.cwd.items } };
+
+        const params = msgpack.Value{ .map = map_items };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "cwd_changed", params });
         defer self.allocator.free(msg_bytes);
 
-        log.info("Sending pwd_changed for pty {}: {s}", .{ pty_instance.id, pty_instance.pwd.items });
+        log.info("Sending cwd_changed for pty {}: {s}", .{ pty_instance.id, pty_instance.cwd.items });
 
-        for (pty_instance.clients.items) |client| {
-            try client.sendData(self.loop, msg_bytes);
+        // Send to each client attached to this pty (same pattern as sendRedraw)
+        for (self.clients.items) |client| {
+            var attached = false;
+            for (client.attached_sessions.items) |sid| {
+                if (sid == pty_instance.id) {
+                    attached = true;
+                    break;
+                }
+            }
+            if (attached) {
+                try client.sendData(self.loop, msg_bytes);
+            }
         }
     }
 
@@ -2459,7 +2475,7 @@ const Server = struct {
         pty_instance.render_state.deinit(self.allocator);
         pty_instance.clients.deinit(self.allocator);
         pty_instance.title.deinit(self.allocator);
-        pty_instance.pwd.deinit(self.allocator);
+        pty_instance.cwd.deinit(self.allocator);
         self.allocator.destroy(pty_instance);
     }
 };
@@ -2934,8 +2950,8 @@ test "buildRedrawMessageFromPty" {
         .allocator = allocator,
         .title = std.ArrayList(u8).empty,
         .title_dirty = false,
-        .pwd = std.ArrayList(u8).empty,
-        .pwd_dirty = false,
+        .cwd = std.ArrayList(u8).empty,
+        .cwd_dirty = false,
         .pipe_fds = undefined,
         .exit_pipe_fds = undefined,
         .render_state = .empty,
@@ -2946,7 +2962,7 @@ test "buildRedrawMessageFromPty" {
         pty_inst.render_state.deinit(allocator);
         pty_inst.clients.deinit(allocator);
         pty_inst.title.deinit(allocator);
-        pty_inst.pwd.deinit(allocator);
+        pty_inst.cwd.deinit(allocator);
     }
 
     const msg = try buildRedrawMessageFromPty(allocator, &pty_inst, .full);
@@ -2972,8 +2988,8 @@ test "style optimization" {
         .allocator = allocator,
         .title = std.ArrayList(u8).empty,
         .title_dirty = false,
-        .pwd = std.ArrayList(u8).empty,
-        .pwd_dirty = false,
+        .cwd = std.ArrayList(u8).empty,
+        .cwd_dirty = false,
         .pipe_fds = undefined,
         .exit_pipe_fds = undefined,
         .render_state = .empty,
@@ -2984,7 +3000,7 @@ test "style optimization" {
         pty_inst.render_state.deinit(allocator);
         pty_inst.clients.deinit(allocator);
         pty_inst.title.deinit(allocator);
-        pty_inst.pwd.deinit(allocator);
+        pty_inst.cwd.deinit(allocator);
     }
 
     const handler = vt_handler.Handler.init(&pty_inst.terminal);
@@ -3118,8 +3134,8 @@ test "server - pty exit notification" {
         .allocator = allocator,
         .title = std.ArrayList(u8).empty,
         .title_dirty = false,
-        .pwd = std.ArrayList(u8).empty,
-        .pwd_dirty = false,
+        .cwd = std.ArrayList(u8).empty,
+        .cwd_dirty = false,
         .pipe_fds = pipe_fds,
         .exit_pipe_fds = exit_pipe_fds,
         .render_state = .empty,

@@ -82,6 +82,7 @@ pub const UI = struct {
         rows: u16,
         cols: u16,
         attach: bool,
+        cwd: ?[]const u8 = null,
     };
 
     pub fn init(allocator: std.mem.Allocator) !UI {
@@ -260,6 +261,10 @@ pub const UI = struct {
 
             _ = lua.getField(1, "attach");
             if (lua.isBoolean(-1)) opts.attach = lua.toBoolean(-1);
+            lua.pop(1);
+
+            _ = lua.getField(1, "cwd");
+            if (lua.isString(-1)) opts.cwd = lua.toString(-1) catch null;
             lua.pop(1);
 
             cb(ui.spawn_ctx, opts) catch |err| {
@@ -528,9 +533,9 @@ pub const UI = struct {
         return widget.parseWidget(self.lua, self.allocator, -1);
     }
 
-    pub const PwdLookupFn = *const fn (ctx: *anyopaque, id: i64) ?[]const u8;
+    pub const CwdLookupFn = *const fn (ctx: *anyopaque, id: i64) ?[]const u8;
 
-    pub fn getStateJson(self: *UI, pwd_lookup_fn: ?PwdLookupFn, pwd_lookup_ctx: *anyopaque) ![]u8 {
+    pub fn getStateJson(self: *UI, cwd_lookup_fn: ?CwdLookupFn, cwd_lookup_ctx: *anyopaque) ![]u8 {
         _ = self.lua.getField(ziglua.registry_index, "prise_ui");
         defer self.lua.pop(1);
 
@@ -539,17 +544,17 @@ pub const UI = struct {
             return error.NoGetStateFunction;
         }
 
-        // Create pwd_lookup closure if provided
-        if (pwd_lookup_fn != null) {
+        // Create cwd_lookup closure if provided
+        if (cwd_lookup_fn != null) {
             const LookupCtx = struct {
                 ctx: *anyopaque,
-                lookup_fn: PwdLookupFn,
+                lookup_fn: CwdLookupFn,
             };
             const lookup_ctx = try self.allocator.create(LookupCtx);
-            lookup_ctx.* = .{ .ctx = pwd_lookup_ctx, .lookup_fn = pwd_lookup_fn.? };
+            lookup_ctx.* = .{ .ctx = cwd_lookup_ctx, .lookup_fn = cwd_lookup_fn.? };
 
             self.lua.pushLightUserdata(lookup_ctx);
-            self.lua.pushClosure(ziglua.wrap(pwdLookupWrapper), 1);
+            self.lua.pushClosure(ziglua.wrap(cwdLookupWrapper), 1);
         } else {
             self.lua.pushNil();
         }
@@ -575,6 +580,7 @@ pub const UI = struct {
         send_paste_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
         set_focus_fn: *const fn (app: *anyopaque, id: u32, focused: bool) anyerror!void,
         close_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
+        cwd_fn: *const fn (app: *anyopaque, id: u32) ?[]const u8,
     };
 
     pub const PtyLookupFn = *const fn (ctx: *anyopaque, id: u32) ?PtyLookupResult;
@@ -623,7 +629,7 @@ pub const UI = struct {
         const result = lookup_ctx.lookup_fn(lookup_ctx.ctx, id);
 
         if (result) |r| {
-            lua_event.pushPtyUserdata(lua, id, r.surface, r.app, r.send_key_fn, r.send_mouse_fn, r.send_paste_fn, r.set_focus_fn, r.close_fn) catch {
+            lua_event.pushPtyUserdata(lua, id, r.surface, r.app, r.send_key_fn, r.send_mouse_fn, r.send_paste_fn, r.set_focus_fn, r.close_fn, r.cwd_fn) catch {
                 lua.pushNil();
             };
         } else {
@@ -632,18 +638,18 @@ pub const UI = struct {
         return 1;
     }
 
-    fn pwdLookupWrapper(lua: *ziglua.Lua) i32 {
+    fn cwdLookupWrapper(lua: *ziglua.Lua) i32 {
         const LookupCtx = struct {
             ctx: *anyopaque,
-            lookup_fn: PwdLookupFn,
+            lookup_fn: CwdLookupFn,
         };
         const lookup_ctx = lua.toUserdata(LookupCtx, ziglua.Lua.upvalueIndex(1)) catch return 0;
 
         const id: i64 = lua.checkInteger(1);
-        const pwd = lookup_ctx.lookup_fn(lookup_ctx.ctx, id);
+        const cwd = lookup_ctx.lookup_fn(lookup_ctx.ctx, id);
 
-        if (pwd) |p| {
-            _ = lua.pushString(p);
+        if (cwd) |c| {
+            _ = lua.pushString(c);
         } else {
             lua.pushNil();
         }

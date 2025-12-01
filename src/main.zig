@@ -29,9 +29,8 @@ fn fileLogFn(
     const file = log_file orelse return;
     const scope_prefix = if (scope == .default) "" else "(" ++ @tagName(scope) ++ ") ";
     const prefix = "[" ++ comptime level.asText() ++ "] " ++ scope_prefix;
-    var writer = file.writer(&log_buffer);
-    writer.interface.print(prefix ++ format ++ "\n", args) catch {};
-    writer.interface.flush() catch {};
+    const msg = std.fmt.bufPrint(&log_buffer, prefix ++ format ++ "\n", args) catch return;
+    _ = file.write(msg) catch {};
 }
 
 const MAX_LOG_SIZE = 64 * 1024 * 1024; // 64 MiB

@@ -25,6 +25,7 @@ pub const Event = union(enum) {
         send_paste_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
         set_focus_fn: *const fn (app: *anyopaque, id: u32, focused: bool) anyerror!void,
         close_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
+        cwd_fn: *const fn (app: *anyopaque, id: u32) ?[]const u8,
     },
     pty_exited: struct {
         id: u32,
@@ -104,6 +105,7 @@ pub fn pushEvent(lua: *ziglua.Lua, event: Event) !void {
                 .send_paste_fn = info.send_paste_fn,
                 .set_focus_fn = info.set_focus_fn,
                 .close_fn = info.close_fn,
+                .cwd_fn = info.cwd_fn,
             };
 
             _ = lua.getMetatableRegistry("PrisePty");
@@ -339,6 +341,7 @@ const PtyHandle = struct {
     send_paste_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
     set_focus_fn: *const fn (app: *anyopaque, id: u32, focused: bool) anyerror!void,
     close_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
+    cwd_fn: *const fn (app: *anyopaque, id: u32) ?[]const u8,
 };
 
 fn ptyIndex(lua: *ziglua.Lua) i32 {
@@ -375,6 +378,10 @@ fn ptyIndex(lua: *ziglua.Lua) i32 {
         lua.pushFunction(ziglua.wrap(ptySize));
         return 1;
     }
+    if (std.mem.eql(u8, key, "cwd")) {
+        lua.pushFunction(ziglua.wrap(ptyCwd));
+        return 1;
+    }
     return 0;
 }
 
@@ -398,6 +405,16 @@ fn ptyTitle(lua: *ziglua.Lua) i32 {
 fn ptyId(lua: *ziglua.Lua) i32 {
     const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
     lua.pushInteger(@intCast(pty.id));
+    return 1;
+}
+
+fn ptyCwd(lua: *ziglua.Lua) i32 {
+    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    if (pty.cwd_fn(pty.app, pty.id)) |cwd| {
+        _ = lua.pushString(cwd);
+    } else {
+        lua.pushNil();
+    }
     return 1;
 }
 
@@ -630,6 +647,7 @@ pub fn pushPtyUserdata(
     send_paste_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
     set_focus_fn: *const fn (app: *anyopaque, id: u32, focused: bool) anyerror!void,
     close_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
+    cwd_fn: *const fn (app: *anyopaque, id: u32) ?[]const u8,
 ) !void {
     const pty = lua.newUserdata(PtyHandle, @sizeOf(PtyHandle));
     pty.* = .{
@@ -641,6 +659,7 @@ pub fn pushPtyUserdata(
         .send_paste_fn = send_paste_fn,
         .set_focus_fn = set_focus_fn,
         .close_fn = close_fn,
+        .cwd_fn = cwd_fn,
     };
 
     _ = lua.getMetatableRegistry("PrisePty");

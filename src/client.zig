@@ -169,7 +169,7 @@ pub const ClientState = struct {
     connection_refused: bool = false,
     next_msgid: u32 = 1,
     pending_requests: std.AutoHashMap(u32, RequestInfo),
-    pwd_map: std.AutoHashMap(i64, []const u8),
+    cwd_map: std.AutoHashMap(i64, []const u8),
     allocator: std.mem.Allocator,
     prefix_mode: bool = false,
 
@@ -183,17 +183,17 @@ pub const ClientState = struct {
         return .{
             .allocator = allocator,
             .pending_requests = std.AutoHashMap(u32, RequestInfo).init(allocator),
-            .pwd_map = std.AutoHashMap(i64, []const u8).init(allocator),
+            .cwd_map = std.AutoHashMap(i64, []const u8).init(allocator),
         };
     }
 
     pub fn deinit(self: *ClientState) void {
         self.pending_requests.deinit();
-        var it = self.pwd_map.valueIterator();
+        var it = self.cwd_map.valueIterator();
         while (it.next()) |val| {
             self.allocator.free(val.*);
         }
-        self.pwd_map.deinit();
+        self.cwd_map.deinit();
     }
 };
 
@@ -321,16 +321,16 @@ pub const ClientLogic = struct {
                         };
                         return .{ .pty_exited = .{ .pty_id = pty_id, .status = status } };
                     }
-                } else if (std.mem.eql(u8, notif.method, "pwd_changed")) {
+                } else if (std.mem.eql(u8, notif.method, "cwd_changed")) {
                     if (notif.params == .map) {
                         var pty_id_val: ?msgpack.Value = null;
-                        var pwd_val: ?msgpack.Value = null;
+                        var cwd_val: ?msgpack.Value = null;
                         for (notif.params.map) |kv| {
                             if (kv.key == .string) {
                                 if (std.mem.eql(u8, kv.key.string, "pty_id")) {
                                     pty_id_val = kv.value;
-                                } else if (std.mem.eql(u8, kv.key.string, "pwd")) {
-                                    pwd_val = kv.value;
+                                } else if (std.mem.eql(u8, kv.key.string, "cwd")) {
+                                    cwd_val = kv.value;
                                 }
                             }
                         }
@@ -340,12 +340,12 @@ pub const ClientLogic = struct {
                                 .unsigned => |u| @as(i64, @intCast(u)),
                                 else => return .none,
                             };
-                            if (pwd_val) |pwd_v| {
-                                if (pwd_v == .string) {
-                                    if (state.pwd_map.getPtr(pty_id)) |entry| {
+                            if (cwd_val) |cwd_v| {
+                                if (cwd_v == .string) {
+                                    if (state.cwd_map.getPtr(pty_id)) |entry| {
                                         state.allocator.free(entry.*);
                                     }
-                                    state.pwd_map.put(pty_id, try state.allocator.dupe(u8, pwd_v.string)) catch return .none;
+                                    state.cwd_map.put(pty_id, try state.allocator.dupe(u8, cwd_v.string)) catch return .none;
                                 }
                             }
                         }
@@ -1881,6 +1881,12 @@ pub const App = struct {
                                                         try self.sendDirect(encoded_msg);
                                                     }
                                                 }.appClosePty,
+                                                .cwd_fn = struct {
+                                                    fn appGetCwd(ctx: *anyopaque, id: u32) ?[]const u8 {
+                                                        const self: *App = @ptrCast(@alignCast(ctx));
+                                                        return self.state.cwd_map.get(@intCast(id));
+                                                    }
+                                                }.appGetCwd,
                                             },
                                         }) catch |err| {
                                             log.err("Failed to update UI with pty_attach: {}", .{err});
@@ -2039,13 +2045,16 @@ pub const App = struct {
         log.info("spawnPty: sending request msgid={}", .{msgid});
         try self.state.pending_requests.put(msgid, .spawn);
 
-        // Manually construct map for spawn params
-        var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 3);
+        const num_params: usize = if (opts.cwd != null) 4 else 3;
+        var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, num_params);
         defer self.allocator.free(map_items);
 
         map_items[0] = .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = opts.rows } };
         map_items[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = opts.cols } };
         map_items[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = opts.attach } };
+        if (opts.cwd) |cwd| {
+            map_items[3] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
+        }
 
         const params = msgpack.Value{ .map = map_items };
         const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "spawn_pty", params });
@@ -2054,13 +2063,13 @@ pub const App = struct {
         try self.sendDirect(msg);
     }
 
-    fn pwdLookup(ctx: *anyopaque, id: i64) ?[]const u8 {
+    fn cwdLookup(ctx: *anyopaque, id: i64) ?[]const u8 {
         const self: *App = @ptrCast(@alignCast(ctx));
-        return self.state.pwd_map.get(id);
+        return self.state.cwd_map.get(id);
     }
 
     pub fn saveSession(self: *App, name: []const u8) !void {
-        const json = try self.ui.getStateJson(&pwdLookup, self);
+        const json = try self.ui.getStateJson(&cwdLookup, self);
         defer self.allocator.free(json);
 
         const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
@@ -2355,6 +2364,12 @@ pub const App = struct {
                     try app.sendDirect(encoded_msg);
                 }
             }.closePty,
+            .cwd_fn = struct {
+                fn getCwd(app_ctx: *anyopaque, pty_id: u32) ?[]const u8 {
+                    const app: *App = @ptrCast(@alignCast(app_ctx));
+                    return app.state.cwd_map.get(@intCast(pty_id));
+                }
+            }.getCwd,
         };
     }
 };

@@ -27,9 +27,9 @@ pub const Handler = struct {
     title_fn: ?*const fn (ctx: ?*anyopaque, title: []const u8) anyerror!void = null,
     title_ctx: ?*anyopaque = null,
 
-    /// Optional callback for notifying pwd changes (OSC 7)
-    pwd_fn: ?*const fn (ctx: ?*anyopaque, pwd: []const u8) anyerror!void = null,
-    pwd_ctx: ?*anyopaque = null,
+    /// Optional callback for notifying cwd changes (OSC 7)
+    cwd_fn: ?*const fn (ctx: ?*anyopaque, cwd: []const u8) anyerror!void = null,
+    cwd_ctx: ?*anyopaque = null,
 
     pub fn init(terminal: *Terminal) Handler {
         return .{
@@ -61,14 +61,14 @@ pub const Handler = struct {
         self.title_fn = title_fn;
     }
 
-    /// Set the callback for notifying pwd changes (OSC 7)
-    pub fn setPwdCallback(
+    /// Set the callback for notifying cwd changes (OSC 7)
+    pub fn setCwdCallback(
         self: *Handler,
         ctx: ?*anyopaque,
-        pwd_fn: *const fn (ctx: ?*anyopaque, pwd: []const u8) anyerror!void,
+        cwd_fn: *const fn (ctx: ?*anyopaque, cwd: []const u8) anyerror!void,
     ) void {
-        self.pwd_ctx = ctx;
-        self.pwd_fn = pwd_fn;
+        self.cwd_ctx = ctx;
+        self.cwd_fn = cwd_fn;
     }
 
     /// Write data back to the PTY (if callback is set)
@@ -258,8 +258,21 @@ pub const Handler = struct {
             },
 
             .report_pwd => {
-                if (self.pwd_fn) |func| {
-                    try func(self.pwd_ctx, self.terminal.pwd.items);
+                if (self.cwd_fn) |func| {
+                    const url = value.url;
+                    // Parse file:// URL to extract path
+                    // Format: file://hostname/path or file:///path
+                    const path = if (std.mem.startsWith(u8, url, "file://")) blk: {
+                        const after_scheme = url[7..];
+                        // Skip hostname (find next /)
+                        if (std.mem.indexOfScalar(u8, after_scheme, '/')) |idx| {
+                            break :blk after_scheme[idx..];
+                        }
+                        break :blk after_scheme;
+                    } else url;
+                    if (path.len > 0) {
+                        try func(self.cwd_ctx, path);
+                    }
                 }
             },
 
