@@ -1030,538 +1030,584 @@ const Client = struct {
 
         switch (msg) {
             .request => |req| {
-                std.debug.assert(req.method.len > 0);
-
-                const result = try self.server.handleRequest(self, req.method, req.params);
-                defer result.deinit(self.server.allocator);
-
-                const response_arr = try self.server.allocator.alloc(msgpack.Value, 4);
-                defer self.server.allocator.free(response_arr);
-                response_arr[0] = msgpack.Value{ .unsigned = 1 }; // type
-                response_arr[1] = msgpack.Value{ .unsigned = req.msgid }; // msgid
-                response_arr[2] = msgpack.Value.nil; // no error
-                response_arr[3] = result; // result
-
-                const response_value = msgpack.Value{ .array = response_arr };
-                const response_bytes = try msgpack.encodeFromValue(self.server.allocator, response_value);
-                defer self.server.allocator.free(response_bytes);
-
-                std.debug.assert(response_bytes.len <= LIMITS.MESSAGE_SIZE_MAX);
-                try self.sendData(loop, response_bytes);
+                try self.handleRpcRequest(loop, req);
             },
             .notification => |notif| {
-                std.debug.assert(notif.method.len > 0);
-
-                if (std.mem.eql(u8, notif.method, "write_pty")) {
-                    if (notif.params == .array and notif.params.array.len >= 2) {
-                        const pty_id: usize = switch (notif.params.array[0]) {
-                            .unsigned => |u| @intCast(u),
-                            .integer => |i| @intCast(i),
-                            else => {
-                                log.warn("write_pty notification: invalid pty_id type", .{});
-                                return;
-                            },
-                        };
-                        const input_data = if (notif.params.array[1] == .binary)
-                            notif.params.array[1].binary
-                        else if (notif.params.array[1] == .string)
-                            notif.params.array[1].string
-                        else {
-                            log.warn("write_pty notification: invalid data type", .{});
-                            return;
-                        };
-
-                        if (self.server.ptys.get(pty_id)) |pty_instance| {
-                            _ = posix.write(pty_instance.process.master, input_data) catch |err| {
-                                log.err("Write to PTY failed: {}", .{err});
-                            };
-                        } else {
-                            log.warn("write_pty notification: PTY {} not found", .{pty_id});
-                        }
-                    } else {
-                        log.warn("write_pty notification: invalid params", .{});
-                    }
-                } else if (std.mem.eql(u8, notif.method, "paste_input")) {
-                    if (notif.params == .array and notif.params.array.len >= 2) {
-                        const pty_id: usize = switch (notif.params.array[0]) {
-                            .unsigned => |u| @intCast(u),
-                            .integer => |i| @intCast(i),
-                            else => {
-                                log.warn("paste_input notification: invalid pty_id type", .{});
-                                return;
-                            },
-                        };
-                        const paste_data = if (notif.params.array[1] == .binary)
-                            notif.params.array[1].binary
-                        else if (notif.params.array[1] == .string)
-                            notif.params.array[1].string
-                        else {
-                            log.warn("paste_input notification: invalid data type", .{});
-                            return;
-                        };
-
-                        if (self.server.ptys.get(pty_id)) |pty_instance| {
-                            pty_instance.terminal_mutex.lock();
-                            const bracketed = pty_instance.terminal.modes.get(.bracketed_paste);
-                            pty_instance.terminal_mutex.unlock();
-
-                            if (bracketed) {
-                                writeAllFd(pty_instance.process.master, "\x1b[200~") catch |err| {
-                                    log.err("Write to PTY failed: {}", .{err});
-                                };
-                                writeAllFd(pty_instance.process.master, paste_data) catch |err| {
-                                    log.err("Write to PTY failed: {}", .{err});
-                                };
-                                writeAllFd(pty_instance.process.master, "\x1b[201~") catch |err| {
-                                    log.err("Write to PTY failed: {}", .{err});
-                                };
-                            } else {
-                                const mutable_data = self.server.allocator.dupe(u8, paste_data) catch |err| {
-                                    log.err("Failed to allocate paste buffer: {}", .{err});
-                                    return;
-                                };
-                                defer self.server.allocator.free(mutable_data);
-                                std.mem.replaceScalar(u8, mutable_data, '\n', '\r');
-                                writeAllFd(pty_instance.process.master, mutable_data) catch |err| {
-                                    log.err("Write to PTY failed: {}", .{err});
-                                };
-                            }
-                        } else {
-                            log.warn("paste_input notification: PTY {} not found", .{pty_id});
-                        }
-                    } else {
-                        log.warn("paste_input notification: invalid params", .{});
-                    }
-                } else if (std.mem.eql(u8, notif.method, "key_input") or std.mem.eql(u8, notif.method, "key_release")) {
-                    const is_release = std.mem.eql(u8, notif.method, "key_release");
-                    if (notif.params == .array and notif.params.array.len >= 2) {
-                        const pty_id: usize = switch (notif.params.array[0]) {
-                            .unsigned => |u| @intCast(u),
-                            .integer => |i| @intCast(i),
-                            else => {
-                                log.warn("key_input notification: invalid pty_id type", .{});
-                                return;
-                            },
-                        };
-                        const key_map = notif.params.array[1];
-
-                        if (self.server.ptys.get(pty_id)) |pty_instance| {
-                            const action: ghostty_vt.input.KeyAction = if (is_release) .release else .press;
-                            const key = key_parse.parseKeyMapWithAction(key_map, action) catch |err| {
-                                log.err("Failed to parse key map: {}", .{err});
-                                return;
-                            };
-
-                            var encode_buf: [32]u8 = undefined;
-                            var writer = std.Io.Writer.fixed(&encode_buf);
-
-                            pty_instance.terminal_mutex.lock();
-                            key_encode.encode(&writer, key, &pty_instance.terminal) catch |err| {
-                                log.err("Failed to encode key: {}", .{err});
-                                pty_instance.terminal_mutex.unlock();
-                                return;
-                            };
-                            pty_instance.terminal_mutex.unlock();
-
-                            const encoded = writer.buffered();
-                            if (encoded.len > 0) {
-                                _ = posix.write(pty_instance.process.master, encoded) catch |err| {
-                                    log.err("Write to PTY failed: {}", .{err});
-                                };
-                            }
-                        } else {
-                            log.warn("key_input notification: PTY {} not found", .{pty_id});
-                        }
-                    } else {
-                        log.warn("key_input notification: invalid params", .{});
-                    }
-                } else if (std.mem.eql(u8, notif.method, "mouse_input")) {
-                    if (notif.params == .array and notif.params.array.len >= 2) {
-                        const pty_id: usize = switch (notif.params.array[0]) {
-                            .unsigned => |u| @intCast(u),
-                            .integer => |i| @intCast(i),
-                            else => {
-                                log.warn("mouse_input notification: invalid pty_id type", .{});
-                                return;
-                            },
-                        };
-                        const mouse_map = notif.params.array[1];
-
-                        if (self.server.ptys.get(pty_id)) |pty_instance| {
-                            const mouse = key_parse.parseMouseMap(mouse_map) catch |err| {
-                                log.err("Failed to parse mouse map: {}", .{err});
-                                return;
-                            };
-
-                            const is_wheel = switch (mouse.button) {
-                                .wheel_up, .wheel_down, .wheel_left, .wheel_right => true,
-                                else => false,
-                            };
-
-                            const State = struct {
-                                terminal: mouse_encode.TerminalState,
-                                active_screen: ghostty_vt.ScreenSet.Key,
-                            };
-                            const state: State = state: {
-                                pty_instance.terminal_mutex.lock();
-                                defer pty_instance.terminal_mutex.unlock();
-                                break :state .{
-                                    .terminal = mouse_encode.TerminalState.init(&pty_instance.terminal),
-                                    .active_screen = pty_instance.terminal.screens.active_key,
-                                };
-                            };
-
-                            if (is_wheel and state.terminal.flags.mouse_event == .none) {
-                                if (state.active_screen == .alternate and
-                                    state.terminal.modes.get(.mouse_alternate_scroll))
-                                {
-                                    const seq: []const u8 = if (state.terminal.modes.get(.cursor_keys))
-                                        (if (mouse.button == .wheel_up) "\x1bOA" else "\x1bOB")
-                                    else
-                                        (if (mouse.button == .wheel_up) "\x1b[A" else "\x1b[B");
-                                    _ = posix.write(pty_instance.process.master, seq) catch |err| {
-                                        log.err("Write to PTY failed: {}", .{err});
-                                    };
-                                } else {
-                                    const delta: isize = switch (mouse.button) {
-                                        .wheel_up => -1,
-                                        .wheel_down => 1,
-                                        else => 0,
-                                    };
-                                    if (delta != 0) {
-                                        pty_instance.terminal_mutex.lock();
-                                        pty_instance.terminal.scrollViewport(.{ .delta = delta }) catch |err| {
-                                            log.err("Failed to scroll viewport: {}", .{err});
-                                        };
-                                        pty_instance.terminal_mutex.unlock();
-                                        _ = posix.write(pty_instance.pipe_fds[1], "x") catch {};
-                                    }
-                                }
-                            } else if (mouse.button == .left and state.terminal.flags.mouse_event == .none) {
-                                const col: u16 = @intFromFloat(@max(0, @floor(mouse.x)));
-                                const row: u16 = @intFromFloat(@max(0, @floor(mouse.y)));
-                                const CLICK_INTERVAL_MS: i64 = 500;
-
-                                switch (mouse.type) {
-                                    .press => {
-                                        // Update click count based on timing
-                                        const now = std.time.milliTimestamp();
-                                        if (pty_instance.left_click_count > 0 and
-                                            (now - pty_instance.left_click_time) < CLICK_INTERVAL_MS)
-                                        {
-                                            pty_instance.left_click_count += 1;
-                                            if (pty_instance.left_click_count > 3) {
-                                                pty_instance.left_click_count = 1;
-                                            }
-                                        } else {
-                                            pty_instance.left_click_count = 1;
-                                        }
-                                        pty_instance.left_click_time = now;
-                                        pty_instance.selection_start = .{ .col = col, .row = row };
-
-                                        pty_instance.terminal_mutex.lock();
-                                        defer pty_instance.terminal_mutex.unlock();
-
-                                        const screen = pty_instance.terminal.screens.active;
-                                        const pin = screen.pages.pin(.{ .viewport = .{
-                                            .x = col,
-                                            .y = row,
-                                        } }) orelse return;
-
-                                        switch (pty_instance.left_click_count) {
-                                            1 => {
-                                                // Single click: clear selection
-                                                screen.select(null) catch {};
-                                            },
-                                            2 => {
-                                                // Double click: select word
-                                                if (screen.selectWord(pin)) |sel| {
-                                                    screen.select(sel) catch {};
-                                                }
-                                            },
-                                            3 => {
-                                                // Triple click: select line
-                                                if (screen.selectLine(.{ .pin = pin })) |sel| {
-                                                    screen.select(sel) catch {};
-                                                }
-                                            },
-                                            else => {},
-                                        }
-                                        _ = posix.write(pty_instance.pipe_fds[1], "x") catch {};
-                                    },
-                                    .drag => {
-                                        if (pty_instance.selection_start) |start| {
-                                            pty_instance.terminal_mutex.lock();
-                                            defer pty_instance.terminal_mutex.unlock();
-
-                                            const screen = pty_instance.terminal.screens.active;
-                                            const start_pin = screen.pages.pin(.{ .viewport = .{
-                                                .x = start.col,
-                                                .y = start.row,
-                                            } }) orelse return;
-                                            const end_pin = screen.pages.pin(.{ .viewport = .{
-                                                .x = col,
-                                                .y = row,
-                                            } }) orelse return;
-
-                                            switch (pty_instance.left_click_count) {
-                                                1 => {
-                                                    // Single-click drag: character selection
-                                                    const sel = ghostty_vt.Selection.init(start_pin, end_pin, false);
-                                                    screen.select(sel) catch {};
-                                                },
-                                                2 => {
-                                                    // Double-click drag: word-by-word selection
-                                                    const word_start = screen.selectWord(start_pin);
-                                                    const word_end = screen.selectWord(end_pin);
-                                                    if (word_start != null and word_end != null) {
-                                                        const sel = if (end_pin.before(start_pin))
-                                                            ghostty_vt.Selection.init(word_end.?.start(), word_start.?.end(), false)
-                                                        else
-                                                            ghostty_vt.Selection.init(word_start.?.start(), word_end.?.end(), false);
-                                                        screen.select(sel) catch {};
-                                                    }
-                                                },
-                                                3 => {
-                                                    // Triple-click drag: line-by-line selection
-                                                    const line_start = screen.selectLine(.{ .pin = start_pin });
-                                                    const line_end = screen.selectLine(.{ .pin = end_pin });
-                                                    if (line_start != null and line_end != null) {
-                                                        const sel = if (end_pin.before(start_pin))
-                                                            ghostty_vt.Selection.init(line_end.?.start(), line_start.?.end(), false)
-                                                        else
-                                                            ghostty_vt.Selection.init(line_start.?.start(), line_end.?.end(), false);
-                                                        screen.select(sel) catch {};
-                                                    }
-                                                },
-                                                else => {},
-                                            }
-                                            _ = posix.write(pty_instance.pipe_fds[1], "x") catch {};
-                                        }
-                                    },
-                                    .release => {
-                                        pty_instance.selection_start = null;
-                                    },
-                                    .motion => {},
-                                }
-                            } else {
-                                var encode_buf: [32]u8 = undefined;
-                                var writer = std.Io.Writer.fixed(&encode_buf);
-
-                                mouse_encode.encode(&writer, mouse, state.terminal) catch |err| {
-                                    log.err("Failed to encode mouse: {}", .{err});
-                                    return;
-                                };
-
-                                const encoded = writer.buffered();
-                                if (encoded.len > 0) {
-                                    _ = posix.write(pty_instance.process.master, encoded) catch |err| {
-                                        log.err("Write to PTY failed: {}", .{err});
-                                    };
-                                }
-                            }
-                        } else {
-                            log.warn("mouse_input notification: PTY {} not found", .{pty_id});
-                        }
-                    } else {
-                        log.warn("mouse_input notification: invalid params", .{});
-                    }
-                } else if (std.mem.eql(u8, notif.method, "resize_pty")) {
-                    if (notif.params == .array and notif.params.array.len >= 3) {
-                        const pty_id: usize = switch (notif.params.array[0]) {
-                            .unsigned => |u| @intCast(u),
-                            .integer => |i| @intCast(i),
-                            else => {
-                                log.warn("resize_pty notification: invalid pty_id type", .{});
-                                return;
-                            },
-                        };
-                        const rows: u16 = switch (notif.params.array[1]) {
-                            .unsigned => |u| @intCast(u),
-                            .integer => |i| @intCast(i),
-                            else => {
-                                log.warn("resize_pty notification: invalid rows type", .{});
-                                return;
-                            },
-                        };
-                        const cols: u16 = switch (notif.params.array[2]) {
-                            .unsigned => |u| @intCast(u),
-                            .integer => |i| @intCast(i),
-                            else => {
-                                log.warn("resize_pty notification: invalid cols type", .{});
-                                return;
-                            },
-                        };
-
-                        var x_pixel: u16 = 0;
-                        var y_pixel: u16 = 0;
-
-                        if (notif.params.array.len >= 5) {
-                            x_pixel = switch (notif.params.array[3]) {
-                                .unsigned => |u| @intCast(u),
-                                .integer => |i| @intCast(i),
-                                else => 0,
-                            };
-                            y_pixel = switch (notif.params.array[4]) {
-                                .unsigned => |u| @intCast(u),
-                                .integer => |i| @intCast(i),
-                                else => 0,
-                            };
-                        }
-
-                        if (self.server.ptys.get(pty_id)) |pty_instance| {
-                            // Lock mutex before any terminal state access to avoid race with read thread
-                            pty_instance.terminal_mutex.lock();
-
-                            log.info("resize_pty: pty={} requested={}x{} ({}x{}px) current_terminal={}x{}", .{
-                                pty_id,
-                                cols,
-                                rows,
-                                x_pixel,
-                                y_pixel,
-                                pty_instance.terminal.cols,
-                                pty_instance.terminal.rows,
-                            });
-
-                            const size: pty.winsize = .{
-                                .ws_row = rows,
-                                .ws_col = cols,
-                                .ws_xpixel = x_pixel,
-                                .ws_ypixel = y_pixel,
-                            };
-                            var pty_mut = pty_instance.process;
-                            pty_mut.setSize(size) catch |err| {
-                                log.err("Resize PTY failed: {}", .{err});
-                            };
-                            if (pty_instance.terminal.rows != rows or pty_instance.terminal.cols != cols) {
-                                log.info("resize_pty: resizing terminal from {}x{} to {}x{}", .{
-                                    pty_instance.terminal.cols,
-                                    pty_instance.terminal.rows,
-                                    cols,
-                                    rows,
-                                });
-                                pty_instance.terminal.resize(
-                                    pty_instance.allocator,
-                                    cols,
-                                    rows,
-                                ) catch |err| {
-                                    log.err("Resize terminal failed: {}", .{err});
-                                };
-                            }
-                            // Update pixel dimensions for mouse encoding
-                            pty_instance.terminal.width_px = x_pixel;
-                            pty_instance.terminal.height_px = y_pixel;
-
-                            // Send in-band size report if mode 2048 is enabled
-                            const in_band_enabled = pty_instance.terminal.modes.get(.in_band_size_reports);
-                            log.info("resize_pty: in_band_size_reports mode={}", .{in_band_enabled});
-                            if (in_band_enabled) {
-                                var report_buf: [64]u8 = undefined;
-                                const report = std.fmt.bufPrint(&report_buf, "\x1b[48;{};{};{};{}t", .{
-                                    rows,
-                                    cols,
-                                    y_pixel,
-                                    x_pixel,
-                                }) catch unreachable;
-                                log.info("resize_pty: sending in-band report: {s}", .{report});
-                                _ = posix.write(pty_instance.process.master, report) catch |err| {
-                                    log.err("Failed to send in-band size report: {}", .{err});
-                                };
-                            }
-
-                            pty_instance.terminal_mutex.unlock();
-                            log.info("resize_pty: completed for pty={}", .{pty_id});
-                        } else {
-                            log.warn("resize_pty notification: PTY {} not found", .{pty_id});
-                        }
-                    } else {
-                        log.warn("resize_pty notification: invalid params", .{});
-                    }
-                } else if (std.mem.eql(u8, notif.method, "detach_pty")) {
-                    if (notif.params == .array and notif.params.array.len >= 2) {
-                        const pty_id: usize = switch (notif.params.array[0]) {
-                            .unsigned => |u| @intCast(u),
-                            .integer => |i| @intCast(i),
-                            else => {
-                                log.warn("detach_pty notification: invalid pty_id type", .{});
-                                return;
-                            },
-                        };
-                        const client_fd: posix.fd_t = switch (notif.params.array[1]) {
-                            .unsigned => |u| @intCast(u),
-                            .integer => |i| @intCast(i),
-                            else => {
-                                log.warn("detach_pty notification: invalid client_fd type", .{});
-                                return;
-                            },
-                        };
-
-                        if (self.server.ptys.get(pty_id)) |pty_instance| {
-                            // Mark PTY as keep_alive since client explicitly detached
-                            pty_instance.keep_alive = true;
-
-                            // Find client by fd and detach
-                            for (self.server.clients.items) |c| {
-                                if (c.fd == client_fd) {
-                                    pty_instance.removeClient(c);
-                                    for (c.attached_sessions.items, 0..) |sid, i| {
-                                        if (sid == pty_id) {
-                                            _ = c.attached_sessions.swapRemove(i);
-                                            break;
-                                        }
-                                    }
-                                    log.info("Client {} detached from PTY {} (marked keep_alive)", .{ c.fd, pty_id });
-                                    break;
-                                }
-                            }
-                        } else {
-                            log.warn("detach_pty notification: PTY {} not found", .{pty_id});
-                        }
-                    } else {
-                        log.warn("detach_pty notification: invalid params", .{});
-                    }
-                } else if (std.mem.eql(u8, notif.method, "focus_event")) {
-                    if (notif.params == .array and notif.params.array.len >= 2) {
-                        const pty_id: usize = switch (notif.params.array[0]) {
-                            .unsigned => |u| @intCast(u),
-                            .integer => |i| @intCast(i),
-                            else => {
-                                log.warn("focus_event notification: invalid pty_id type", .{});
-                                return;
-                            },
-                        };
-                        const focused: bool = switch (notif.params.array[1]) {
-                            .boolean => |b| b,
-                            else => {
-                                log.warn("focus_event notification: invalid focused type", .{});
-                                return;
-                            },
-                        };
-
-                        if (self.server.ptys.get(pty_id)) |pty_instance| {
-                            pty_instance.terminal_mutex.lock();
-                            const focus_event_enabled = pty_instance.terminal.modes.get(.focus_event);
-                            pty_instance.terminal_mutex.unlock();
-
-                            if (focus_event_enabled) {
-                                const seq: []const u8 = if (focused) "\x1b[I" else "\x1b[O";
-                                _ = posix.write(pty_instance.process.master, seq) catch |err| {
-                                    log.err("Failed to write focus event to PTY: {}", .{err});
-                                };
-                                log.debug("Sent focus {} to PTY {}", .{ focused, pty_id });
-                            }
-                        } else {
-                            log.warn("focus_event notification: PTY {} not found", .{pty_id});
-                        }
-                    } else {
-                        log.warn("focus_event notification: invalid params", .{});
-                    }
-                }
+                try self.handleNotification(notif);
             },
             .response => {
                 // std.log.warn("Client sent response, ignoring", .{});
             },
         }
+    }
+
+    /// Handle RPC request, send response with result.
+    fn handleRpcRequest(self: *Client, loop: *io.Loop, req: rpc.Request) !void {
+        std.debug.assert(req.method.len > 0);
+
+        const result = try self.server.handleRequest(self, req.method, req.params);
+        defer result.deinit(self.server.allocator);
+
+        const response_arr = try self.server.allocator.alloc(msgpack.Value, 4);
+        defer self.server.allocator.free(response_arr);
+        response_arr[0] = msgpack.Value{ .unsigned = 1 }; // type
+        response_arr[1] = msgpack.Value{ .unsigned = req.msgid }; // msgid
+        response_arr[2] = msgpack.Value.nil; // no error
+        response_arr[3] = result; // result
+
+        const response_value = msgpack.Value{ .array = response_arr };
+        const response_bytes = try msgpack.encodeFromValue(self.server.allocator, response_value);
+        defer self.server.allocator.free(response_bytes);
+
+        std.debug.assert(response_bytes.len <= LIMITS.MESSAGE_SIZE_MAX);
+        try self.sendData(loop, response_bytes);
+    }
+
+    /// Dispatch notification to appropriate handler.
+    fn handleNotification(self: *Client, notif: rpc.Notification) !void {
+        std.debug.assert(notif.method.len > 0);
+
+        if (std.mem.eql(u8, notif.method, "write_pty")) {
+            try self.handleWritePty(notif);
+        } else if (std.mem.eql(u8, notif.method, "paste_input")) {
+            try self.handlePasteInput(notif);
+        } else if (std.mem.eql(u8, notif.method, "key_input") or
+            std.mem.eql(u8, notif.method, "key_release"))
+        {
+            try self.handleKeyEvent(notif);
+        } else if (std.mem.eql(u8, notif.method, "mouse_input")) {
+            try self.handleMouseInput(notif);
+        } else if (std.mem.eql(u8, notif.method, "resize_pty")) {
+            try self.handleResizePty(notif);
+        } else if (std.mem.eql(u8, notif.method, "detach_pty")) {
+            try self.handleDetachPty(notif);
+        } else if (std.mem.eql(u8, notif.method, "focus_event")) {
+            try self.handleFocusEvent(notif);
+        }
+    }
+
+    /// Write binary data to PTY input.
+    fn handleWritePty(self: *Client, notif: rpc.Notification) !void {
+        if (notif.params != .array or notif.params.array.len < 2) {
+            log.warn("write_pty notification: invalid params", .{});
+            return;
+        }
+
+        const pty_id = parsePtyId(notif.params.array[0]) orelse {
+            log.warn("write_pty notification: invalid pty_id type", .{});
+            return;
+        };
+
+        const input_data = parseInputData(notif.params.array[1]) orelse {
+            log.warn("write_pty notification: invalid data type", .{});
+            return;
+        };
+
+        if (self.server.ptys.get(pty_id)) |pty_instance| {
+            _ = posix.write(pty_instance.process.master, input_data) catch |err| {
+                log.err("Write to PTY failed: {}", .{err});
+            };
+        } else {
+            log.warn("write_pty notification: PTY {} not found", .{pty_id});
+        }
+    }
+
+    /// Handle clipboard paste with optional bracketed paste mode.
+    fn handlePasteInput(self: *Client, notif: rpc.Notification) !void {
+        if (notif.params != .array or notif.params.array.len < 2) {
+            log.warn("paste_input notification: invalid params", .{});
+            return;
+        }
+
+        const pty_id = parsePtyId(notif.params.array[0]) orelse {
+            log.warn("paste_input notification: invalid pty_id type", .{});
+            return;
+        };
+
+        const paste_data = parseInputData(notif.params.array[1]) orelse {
+            log.warn("paste_input notification: invalid data type", .{});
+            return;
+        };
+
+        if (self.server.ptys.get(pty_id)) |pty_instance| {
+            pty_instance.terminal_mutex.lock();
+            const bracketed = pty_instance.terminal.modes.get(.bracketed_paste);
+            pty_instance.terminal_mutex.unlock();
+
+            if (bracketed) {
+                writeAllFd(pty_instance.process.master, "\x1b[200~") catch |err| {
+                    log.err("Write to PTY failed: {}", .{err});
+                };
+                writeAllFd(pty_instance.process.master, paste_data) catch |err| {
+                    log.err("Write to PTY failed: {}", .{err});
+                };
+                writeAllFd(pty_instance.process.master, "\x1b[201~") catch |err| {
+                    log.err("Write to PTY failed: {}", .{err});
+                };
+            } else {
+                const mutable_data = self.server.allocator.dupe(u8, paste_data) catch |err| {
+                    log.err("Failed to allocate paste buffer: {}", .{err});
+                    return;
+                };
+                defer self.server.allocator.free(mutable_data);
+                std.mem.replaceScalar(u8, mutable_data, '\n', '\r');
+                writeAllFd(pty_instance.process.master, mutable_data) catch |err| {
+                    log.err("Write to PTY failed: {}", .{err});
+                };
+            }
+        } else {
+            log.warn("paste_input notification: PTY {} not found", .{pty_id});
+        }
+    }
+
+    /// Handle keyboard press/release events.
+    fn handleKeyEvent(self: *Client, notif: rpc.Notification) !void {
+        if (notif.params != .array or notif.params.array.len < 2) {
+            log.warn("key_input notification: invalid params", .{});
+            return;
+        }
+
+        const is_release = std.mem.eql(u8, notif.method, "key_release");
+        const pty_id = parsePtyId(notif.params.array[0]) orelse {
+            log.warn("key_input notification: invalid pty_id type", .{});
+            return;
+        };
+        const key_map = notif.params.array[1];
+
+        if (self.server.ptys.get(pty_id)) |pty_instance| {
+            const action: ghostty_vt.input.KeyAction = if (is_release) .release else .press;
+            const key = key_parse.parseKeyMapWithAction(key_map, action) catch |err| {
+                log.err("Failed to parse key map: {}", .{err});
+                return;
+            };
+
+            var encode_buf: [32]u8 = undefined;
+            var writer = std.Io.Writer.fixed(&encode_buf);
+
+            pty_instance.terminal_mutex.lock();
+            key_encode.encode(&writer, key, &pty_instance.terminal) catch |err| {
+                log.err("Failed to encode key: {}", .{err});
+                pty_instance.terminal_mutex.unlock();
+                return;
+            };
+            pty_instance.terminal_mutex.unlock();
+
+            const encoded = writer.buffered();
+            if (encoded.len > 0) {
+                _ = posix.write(pty_instance.process.master, encoded) catch |err| {
+                    log.err("Write to PTY failed: {}", .{err});
+                };
+            }
+        } else {
+            log.warn("key_input notification: PTY {} not found", .{pty_id});
+        }
+    }
+
+    /// Handle mouse input (click, drag, scroll, motion).
+    fn handleMouseInput(self: *Client, notif: rpc.Notification) !void {
+        if (notif.params != .array or notif.params.array.len < 2) {
+            log.warn("mouse_input notification: invalid params", .{});
+            return;
+        }
+
+        const pty_id = parsePtyId(notif.params.array[0]) orelse {
+            log.warn("mouse_input notification: invalid pty_id type", .{});
+            return;
+        };
+        const mouse_map = notif.params.array[1];
+
+        if (self.server.ptys.get(pty_id)) |pty_instance| {
+            const mouse = key_parse.parseMouseMap(mouse_map) catch |err| {
+                log.err("Failed to parse mouse map: {}", .{err});
+                return;
+            };
+
+            const is_wheel = switch (mouse.button) {
+                .wheel_up, .wheel_down, .wheel_left, .wheel_right => true,
+                else => false,
+            };
+
+            const State = struct {
+                terminal: mouse_encode.TerminalState,
+                active_screen: ghostty_vt.ScreenSet.Key,
+            };
+            const state: State = state: {
+                pty_instance.terminal_mutex.lock();
+                defer pty_instance.terminal_mutex.unlock();
+                break :state .{
+                    .terminal = mouse_encode.TerminalState.init(&pty_instance.terminal),
+                    .active_screen = pty_instance.terminal.screens.active_key,
+                };
+            };
+
+            if (is_wheel and state.terminal.flags.mouse_event == .none) {
+                try self.handleMouseWheel(pty_instance, mouse, state.terminal, state.active_screen);
+            } else if (mouse.button == .left and state.terminal.flags.mouse_event == .none) {
+                try self.handleMouseSelection(pty_instance, mouse);
+            } else {
+                try self.handleMouseReport(pty_instance, mouse, state.terminal);
+            }
+        } else {
+            log.warn("mouse_input notification: PTY {} not found", .{pty_id});
+        }
+    }
+
+    /// Handle mouse wheel scrolling.
+    fn handleMouseWheel(
+        self: *Client,
+        pty_instance: *Pty,
+        mouse: key_parse.MouseEvent,
+        terminal: mouse_encode.TerminalState,
+        active_screen: ghostty_vt.ScreenSet.Key,
+    ) !void {
+        _ = self;
+        if (active_screen == .alternate and terminal.modes.get(.mouse_alternate_scroll)) {
+            const seq: []const u8 = if (terminal.modes.get(.cursor_keys))
+                (if (mouse.button == .wheel_up) "\x1bOA" else "\x1bOB")
+            else
+                (if (mouse.button == .wheel_up) "\x1b[A" else "\x1b[B");
+            _ = posix.write(pty_instance.process.master, seq) catch |err| {
+                log.err("Write to PTY failed: {}", .{err});
+            };
+        } else {
+            const delta: isize = switch (mouse.button) {
+                .wheel_up => -1,
+                .wheel_down => 1,
+                else => 0,
+            };
+            if (delta != 0) {
+                pty_instance.terminal_mutex.lock();
+                pty_instance.terminal.scrollViewport(.{ .delta = delta }) catch |err| {
+                    log.err("Failed to scroll viewport: {}", .{err});
+                };
+                pty_instance.terminal_mutex.unlock();
+                _ = posix.write(pty_instance.pipe_fds[1], "x") catch {};
+            }
+        }
+    }
+
+    /// Handle left-click selection: single, double, triple, and drag.
+    fn handleMouseSelection(self: *Client, pty_instance: *Pty, mouse: key_parse.MouseEvent) !void {
+        _ = self;
+        const col: u16 = @intFromFloat(@max(0, @floor(mouse.x)));
+        const row: u16 = @intFromFloat(@max(0, @floor(mouse.y)));
+        const CLICK_INTERVAL_MS: i64 = 500;
+
+        switch (mouse.type) {
+            .press => {
+                // Update click count based on timing
+                const now = std.time.milliTimestamp();
+                if (pty_instance.left_click_count > 0 and
+                    (now - pty_instance.left_click_time) < CLICK_INTERVAL_MS)
+                {
+                    pty_instance.left_click_count += 1;
+                    if (pty_instance.left_click_count > 3) {
+                        pty_instance.left_click_count = 1;
+                    }
+                } else {
+                    pty_instance.left_click_count = 1;
+                }
+                pty_instance.left_click_time = now;
+                pty_instance.selection_start = .{ .col = col, .row = row };
+
+                pty_instance.terminal_mutex.lock();
+                defer pty_instance.terminal_mutex.unlock();
+
+                const screen = pty_instance.terminal.screens.active;
+                const pin = screen.pages.pin(.{ .viewport = .{
+                    .x = col,
+                    .y = row,
+                } }) orelse return;
+
+                switch (pty_instance.left_click_count) {
+                    1 => screen.select(null) catch {},
+                    2 => {
+                        if (screen.selectWord(pin)) |sel| {
+                            screen.select(sel) catch {};
+                        }
+                    },
+                    3 => {
+                        if (screen.selectLine(.{ .pin = pin })) |sel| {
+                            screen.select(sel) catch {};
+                        }
+                    },
+                    else => {},
+                }
+                _ = posix.write(pty_instance.pipe_fds[1], "x") catch {};
+            },
+            .drag => {
+                if (pty_instance.selection_start) |start| {
+                    pty_instance.terminal_mutex.lock();
+                    defer pty_instance.terminal_mutex.unlock();
+
+                    const screen = pty_instance.terminal.screens.active;
+                    const start_pin = screen.pages.pin(.{ .viewport = .{
+                        .x = start.col,
+                        .y = start.row,
+                    } }) orelse return;
+                    const end_pin = screen.pages.pin(.{ .viewport = .{
+                        .x = col,
+                        .y = row,
+                    } }) orelse return;
+
+                    switch (pty_instance.left_click_count) {
+                        1 => {
+                            const sel = ghostty_vt.Selection.init(start_pin, end_pin, false);
+                            screen.select(sel) catch {};
+                        },
+                        2 => {
+                            const word_start = screen.selectWord(start_pin);
+                            const word_end = screen.selectWord(end_pin);
+                            if (word_start != null and word_end != null) {
+                                const sel = if (end_pin.before(start_pin))
+                                    ghostty_vt.Selection.init(word_end.?.start(), word_start.?.end(), false)
+                                else
+                                    ghostty_vt.Selection.init(word_start.?.start(), word_end.?.end(), false);
+                                screen.select(sel) catch {};
+                            }
+                        },
+                        3 => {
+                            const line_start = screen.selectLine(.{ .pin = start_pin });
+                            const line_end = screen.selectLine(.{ .pin = end_pin });
+                            if (line_start != null and line_end != null) {
+                                const sel = if (end_pin.before(start_pin))
+                                    ghostty_vt.Selection.init(line_end.?.start(), line_start.?.end(), false)
+                                else
+                                    ghostty_vt.Selection.init(line_start.?.start(), line_end.?.end(), false);
+                                screen.select(sel) catch {};
+                            }
+                        },
+                        else => {},
+                    }
+                    _ = posix.write(pty_instance.pipe_fds[1], "x") catch {};
+                }
+            },
+            .release => {
+                pty_instance.selection_start = null;
+            },
+            .motion => {},
+        }
+    }
+
+    /// Handle mouse report for sending to terminal.
+    fn handleMouseReport(
+        self: *Client,
+        pty_instance: *Pty,
+        mouse: key_parse.MouseEvent,
+        terminal: mouse_encode.TerminalState,
+    ) !void {
+        _ = self;
+        var encode_buf: [32]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&encode_buf);
+
+        mouse_encode.encode(&writer, mouse, terminal) catch |err| {
+            log.err("Failed to encode mouse: {}", .{err});
+            return;
+        };
+
+        const encoded = writer.buffered();
+        if (encoded.len > 0) {
+            _ = posix.write(pty_instance.process.master, encoded) catch |err| {
+                log.err("Write to PTY failed: {}", .{err});
+            };
+        }
+    }
+
+    /// Resize PTY and update terminal dimensions.
+    fn handleResizePty(self: *Client, notif: rpc.Notification) !void {
+        if (notif.params != .array or notif.params.array.len < 3) {
+            log.warn("resize_pty notification: invalid params", .{});
+            return;
+        }
+
+        const pty_id = parsePtyId(notif.params.array[0]) orelse {
+            log.warn("resize_pty notification: invalid pty_id type", .{});
+            return;
+        };
+        const rows = parseU16(notif.params.array[1]) orelse {
+            log.warn("resize_pty notification: invalid rows type", .{});
+            return;
+        };
+        const cols = parseU16(notif.params.array[2]) orelse {
+            log.warn("resize_pty notification: invalid cols type", .{});
+            return;
+        };
+
+        var x_pixel: u16 = 0;
+        var y_pixel: u16 = 0;
+        if (notif.params.array.len >= 5) {
+            x_pixel = parseU16(notif.params.array[3]) orelse 0;
+            y_pixel = parseU16(notif.params.array[4]) orelse 0;
+        }
+
+        if (self.server.ptys.get(pty_id)) |pty_instance| {
+            pty_instance.terminal_mutex.lock();
+
+            log.info("resize_pty: pty={} requested={}x{} ({}x{}px) current_terminal={}x{}", .{
+                pty_id,                     cols,                       rows, x_pixel, y_pixel,
+                pty_instance.terminal.cols, pty_instance.terminal.rows,
+            });
+
+            const size: pty.winsize = .{
+                .ws_row = rows,
+                .ws_col = cols,
+                .ws_xpixel = x_pixel,
+                .ws_ypixel = y_pixel,
+            };
+            var pty_mut = pty_instance.process;
+            pty_mut.setSize(size) catch |err| {
+                log.err("Resize PTY failed: {}", .{err});
+            };
+            if (pty_instance.terminal.rows != rows or pty_instance.terminal.cols != cols) {
+                log.info("resize_pty: resizing terminal from {}x{} to {}x{}", .{
+                    pty_instance.terminal.cols,
+                    pty_instance.terminal.rows,
+                    cols,
+                    rows,
+                });
+                pty_instance.terminal.resize(
+                    pty_instance.allocator,
+                    cols,
+                    rows,
+                ) catch |err| {
+                    log.err("Resize terminal failed: {}", .{err});
+                };
+            }
+            // Update pixel dimensions for mouse encoding
+            pty_instance.terminal.width_px = x_pixel;
+            pty_instance.terminal.height_px = y_pixel;
+
+            // Send in-band size report if mode 2048 is enabled
+            const in_band_enabled = pty_instance.terminal.modes.get(.in_band_size_reports);
+            log.info("resize_pty: in_band_size_reports mode={}", .{in_band_enabled});
+            if (in_band_enabled) {
+                var report_buf: [64]u8 = undefined;
+                const report = std.fmt.bufPrint(&report_buf, "\x1b[48;{};{};{};{}t", .{
+                    rows,
+                    cols,
+                    y_pixel,
+                    x_pixel,
+                }) catch unreachable;
+                log.info("resize_pty: sending in-band report: {s}", .{report});
+                _ = posix.write(pty_instance.process.master, report) catch |err| {
+                    log.err("Failed to send in-band size report: {}", .{err});
+                };
+            }
+
+            pty_instance.terminal_mutex.unlock();
+            log.info("resize_pty: completed for pty={}", .{pty_id});
+        } else {
+            log.warn("resize_pty notification: PTY {} not found", .{pty_id});
+        }
+    }
+
+    /// Detach client from PTY.
+    fn handleDetachPty(self: *Client, notif: rpc.Notification) !void {
+        if (notif.params != .array or notif.params.array.len < 2) {
+            log.warn("detach_pty notification: invalid params", .{});
+            return;
+        }
+
+        const pty_id = parsePtyId(notif.params.array[0]) orelse {
+            log.warn("detach_pty notification: invalid pty_id type", .{});
+            return;
+        };
+        const client_fd = parseFd(notif.params.array[1]) orelse {
+            log.warn("detach_pty notification: invalid client_fd type", .{});
+            return;
+        };
+
+        if (self.server.ptys.get(pty_id)) |pty_instance| {
+            pty_instance.keep_alive = true;
+
+            for (self.server.clients.items) |c| {
+                if (c.fd == client_fd) {
+                    pty_instance.removeClient(c);
+                    for (c.attached_sessions.items, 0..) |sid, i| {
+                        if (sid == pty_id) {
+                            _ = c.attached_sessions.swapRemove(i);
+                            break;
+                        }
+                    }
+                    log.info("Client {} detached from PTY {} (marked keep_alive)", .{ c.fd, pty_id });
+                    break;
+                }
+            }
+        } else {
+            log.warn("detach_pty notification: PTY {} not found", .{pty_id});
+        }
+    }
+
+    /// Send focus in/out event to terminal.
+    fn handleFocusEvent(self: *Client, notif: rpc.Notification) !void {
+        if (notif.params != .array or notif.params.array.len < 2) {
+            log.warn("focus_event notification: invalid params", .{});
+            return;
+        }
+
+        const pty_id = parsePtyId(notif.params.array[0]) orelse {
+            log.warn("focus_event notification: invalid pty_id type", .{});
+            return;
+        };
+        const focused: bool = switch (notif.params.array[1]) {
+            .boolean => |b| b,
+            else => {
+                log.warn("focus_event notification: invalid focused type", .{});
+                return;
+            },
+        };
+
+        if (self.server.ptys.get(pty_id)) |pty_instance| {
+            pty_instance.terminal_mutex.lock();
+            const focus_event_enabled = pty_instance.terminal.modes.get(.focus_event);
+            pty_instance.terminal_mutex.unlock();
+
+            if (focus_event_enabled) {
+                const seq: []const u8 = if (focused) "\x1b[I" else "\x1b[O";
+                _ = posix.write(pty_instance.process.master, seq) catch |err| {
+                    log.err("Failed to write focus event to PTY: {}", .{err});
+                };
+                log.debug("Sent focus {} to PTY {}", .{ focused, pty_id });
+            }
+        } else {
+            log.warn("focus_event notification: PTY {} not found", .{pty_id});
+        }
+    }
+
+    /// Parse PTY ID from msgpack value, returns null if invalid type.
+    fn parsePtyId(val: msgpack.Value) ?usize {
+        return switch (val) {
+            .unsigned => |u| @intCast(u),
+            .integer => |i| @intCast(i),
+            else => null,
+        };
+    }
+
+    /// Parse u16 from msgpack value, returns null if invalid type.
+    fn parseU16(val: msgpack.Value) ?u16 {
+        return switch (val) {
+            .unsigned => |u| @intCast(u),
+            .integer => |i| @intCast(i),
+            else => null,
+        };
+    }
+
+    /// Parse file descriptor from msgpack value, returns null if invalid type.
+    fn parseFd(val: msgpack.Value) ?posix.fd_t {
+        return switch (val) {
+            .unsigned => |u| @intCast(u),
+            .integer => |i| @intCast(i),
+            else => null,
+        };
+    }
+
+    /// Parse input data (string or binary) from msgpack value, returns null if invalid type.
+    fn parseInputData(val: msgpack.Value) ?[]const u8 {
+        return switch (val) {
+            .binary => |b| b,
+            .string => |s| s,
+            else => null,
+        };
     }
 
     fn onRecv(loop: *io.Loop, completion: io.Completion) anyerror!void {
