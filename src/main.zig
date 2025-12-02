@@ -141,9 +141,16 @@ fn handleSessionCommand(allocator: std.mem.Allocator, args: *std.process.ArgIter
         };
         try renameSession(allocator, old_name, new_name);
         return null;
+    } else if (std.mem.eql(u8, subcmd, "delete")) {
+        const name = args.next() orelse {
+            log.err("Usage: prise session delete <name>", .{});
+            return error.MissingArgument;
+        };
+        try deleteSession(allocator, name);
+        return null;
     } else {
         log.err("Unknown session command: {s}", .{subcmd});
-        log.err("Available commands: attach, list, rename", .{});
+        log.err("Available commands: attach, list, rename, delete", .{});
         return error.UnknownCommand;
     }
 }
@@ -291,6 +298,40 @@ fn renameSession(allocator: std.mem.Allocator, old_name: []const u8, new_name: [
 
     try stdout.interface.print("Session '{s}' already exists.\n", .{new_name});
     return error.SessionAlreadyExists;
+}
+
+fn deleteSession(allocator: std.mem.Allocator, name: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    defer stdout.interface.flush() catch {};
+
+    const result = getSessionsDir(allocator) catch |err| {
+        if (err == error.NoSessionsFound) {
+            try stdout.interface.print("Session '{s}' not found.\n", .{name});
+            return error.SessionNotFound;
+        }
+        return err;
+    };
+    defer allocator.free(result.path);
+    var dir = result.dir;
+    defer dir.close();
+
+    var filename_buf: [256]u8 = undefined;
+    const filename = std.fmt.bufPrint(&filename_buf, "{s}.json", .{name}) catch {
+        try stdout.interface.print("Session name too long.\n", .{});
+        return error.NameTooLong;
+    };
+
+    dir.deleteFile(filename) catch |err| {
+        if (err == error.FileNotFound) {
+            try stdout.interface.print("Session '{s}' not found.\n", .{name});
+            return error.SessionNotFound;
+        }
+        try stdout.interface.print("Failed to delete session: {}\n", .{err});
+        return err;
+    };
+
+    try stdout.interface.print("Deleted session '{s}'.\n", .{name});
 }
 
 fn listPtys(allocator: std.mem.Allocator, socket_path: []const u8) !void {
