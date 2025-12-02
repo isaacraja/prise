@@ -177,11 +177,13 @@ pub const ClientState = struct {
     cwd_map: std.AutoHashMap(i64, []const u8),
     allocator: std.mem.Allocator,
     prefix_mode: bool = false,
+    pty_validity: ?i64 = null,
 
     pub const RequestInfo = union(enum) {
         spawn,
         attach: struct { pty_id: i64, cwd: ?[]const u8 = null },
         detach,
+        get_server_info,
     };
 
     pub fn init(allocator: std.mem.Allocator) ClientState {
@@ -211,6 +213,7 @@ pub const ServerAction = union(enum) {
     pty_exited: struct { pty_id: u32, status: u32 },
     detached,
     color_query: ColorQueryTarget,
+    server_info: struct { pty_validity: i64 },
 
     pub const ColorQueryTarget = struct {
         pty_id: u32,
@@ -280,9 +283,28 @@ pub const ClientLogic = struct {
                     return .{ .attached = attach_info.pty_id };
                 },
                 .detach => .detached,
+                .get_server_info => handleServerInfoResult(state, result),
             };
         }
         return handleUnsolicitedResult(state, result);
+    }
+
+    fn handleServerInfoResult(state: *ClientState, result: msgpack.Value) ServerAction {
+        if (result != .map) return .none;
+
+        for (result.map) |kv| {
+            if (kv.key == .string and std.mem.eql(u8, kv.key.string, "pty_validity")) {
+                const validity: i64 = switch (kv.value) {
+                    .integer => |i| i,
+                    .unsigned => |u| @intCast(u),
+                    else => continue,
+                };
+                state.pty_validity = validity;
+                log.info("Got pty_validity: {}", .{validity});
+                return .{ .server_info = .{ .pty_validity = validity } };
+            }
+        }
+        return .none;
     }
 
     fn handleSpawnResult(state: *ClientState, result: msgpack.Value) ServerAction {
@@ -1718,54 +1740,9 @@ pub const App = struct {
                         .cb = onRecv,
                     });
 
-                    // Vaxis and surface are already initialized from first winsize event
-                    const ws = try vaxis.Tty.getWinsize(app.tty.fd);
-
-                    if (app.attach_session) |session_name| {
-                        // Attach mode: load session and attach to existing PTYs
-                        try app.startSessionAttach(session_name);
-                    } else {
-                        // Normal mode: spawn new PTY
-                        const msgid = app.state.next_msgid;
-                        app.state.next_msgid += 1;
-                        try app.state.pending_requests.put(msgid, .spawn);
-
-                        var env_map = try std.process.getEnvMap(app.allocator);
-                        defer env_map.deinit();
-
-                        var env_array = std.ArrayList(msgpack.Value).empty;
-                        defer env_array.deinit(app.allocator);
-                        var env_it = env_map.iterator();
-                        while (env_it.next()) |entry| {
-                            const env_str = try std.fmt.allocPrint(app.allocator, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
-                            try env_array.append(app.allocator, .{ .string = env_str });
-                        }
-
-                        const param_count: usize = if (app.initial_cwd != null) 5 else 4;
-                        var params_kv = try app.allocator.alloc(msgpack.Value.KeyValue, param_count);
-                        defer app.allocator.free(params_kv);
-                        log.info("Sending spawn_pty: rows={} cols={} cwd={?s} env_count={}", .{ ws.rows, ws.cols, app.initial_cwd, env_array.items.len });
-                        params_kv[0] = .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = ws.rows } };
-                        params_kv[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = ws.cols } };
-                        params_kv[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = true } };
-                        params_kv[3] = .{ .key = .{ .string = "env" }, .value = .{ .array = env_array.items } };
-                        if (app.initial_cwd) |cwd| {
-                            params_kv[4] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
-                        }
-                        const params_val = msgpack.Value{ .map = params_kv };
-                        var arr = try app.allocator.alloc(msgpack.Value, 4);
-                        defer app.allocator.free(arr);
-                        arr[0] = .{ .unsigned = 0 };
-                        arr[1] = .{ .unsigned = msgid };
-                        arr[2] = .{ .string = "spawn_pty" };
-                        arr[3] = params_val;
-                        app.send_buffer = try msgpack.encodeFromValue(app.allocator, msgpack.Value{ .array = arr });
-
-                        app.send_task = try l.send(fd, app.send_buffer.?, .{
-                            .ptr = app,
-                            .cb = onSendComplete,
-                        });
-                    }
+                    // First, get server info to obtain pty_validity
+                    // After receiving server_info, onServerInfo will continue with spawn/attach
+                    try app.sendGetServerInfo();
                 } else {
                     log.info("Connected but should_quit=true, not sending spawn_pty", .{});
                 }
@@ -1779,6 +1756,61 @@ pub const App = struct {
             },
             else => unreachable,
         }
+    }
+
+    fn sendGetServerInfo(self: *App) !void {
+        const msgid = self.state.next_msgid;
+        self.state.next_msgid += 1;
+        try self.state.pending_requests.put(msgid, .get_server_info);
+
+        // [0, msgid, "get_server_info", {}]
+        const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "get_server_info", .{} });
+        try self.sendDirect(msg);
+        self.allocator.free(msg);
+    }
+
+    fn onServerInfoReceived(self: *App) !void {
+        // After receiving server info, proceed with spawn or session attach
+        if (self.attach_session) |session_name| {
+            try self.startSessionAttach(session_name);
+        } else {
+            try self.spawnInitialPty();
+        }
+    }
+
+    fn spawnInitialPty(self: *App) !void {
+        const ws = try vaxis.Tty.getWinsize(self.tty.fd);
+
+        const msgid = self.state.next_msgid;
+        self.state.next_msgid += 1;
+        try self.state.pending_requests.put(msgid, .spawn);
+
+        var env_map = try std.process.getEnvMap(self.allocator);
+        defer env_map.deinit();
+
+        var env_array = std.ArrayList(msgpack.Value).empty;
+        defer env_array.deinit(self.allocator);
+        var env_it = env_map.iterator();
+        while (env_it.next()) |entry| {
+            const env_str = try std.fmt.allocPrint(self.allocator, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try env_array.append(self.allocator, .{ .string = env_str });
+        }
+
+        const param_count: usize = if (self.initial_cwd != null) 5 else 4;
+        var params_kv = try self.allocator.alloc(msgpack.Value.KeyValue, param_count);
+        defer self.allocator.free(params_kv);
+        log.info("Sending spawn_pty: rows={} cols={} cwd={?s} env_count={}", .{ ws.rows, ws.cols, self.initial_cwd, env_array.items.len });
+        params_kv[0] = .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = ws.rows } };
+        params_kv[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = ws.cols } };
+        params_kv[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = true } };
+        params_kv[3] = .{ .key = .{ .string = "env" }, .value = .{ .array = env_array.items } };
+        if (self.initial_cwd) |cwd| {
+            params_kv[4] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
+        }
+        const params_val = msgpack.Value{ .map = params_kv };
+        const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "spawn_pty", params_val });
+        try self.sendDirect(msg);
+        self.allocator.free(msg);
     }
 
     fn startSessionAttach(self: *App, session_name: []const u8) !void {
@@ -1799,6 +1831,19 @@ pub const App = struct {
         const json = try file.readToEndAlloc(self.allocator, 1024 * 1024);
         self.session_json = json;
 
+        // Check if pty_validity matches - if not, skip attach and spawn fresh
+        const saved_validity = extractPtyValidityFromJson(self.allocator, json);
+        const validity_matches = if (saved_validity) |saved| blk: {
+            if (self.state.pty_validity) |current| {
+                break :blk saved == current;
+            }
+            break :blk false;
+        } else false;
+
+        if (!validity_matches) {
+            log.info("pty_validity mismatch (saved={?}, current={?}), spawning fresh PTYs", .{ saved_validity, self.state.pty_validity });
+        }
+
         const pty_ids = try extractPtyIdsFromJson(self.allocator, json);
         if (pty_ids.len == 0) {
             log.err("No PTY IDs found in session", .{});
@@ -1815,9 +1860,19 @@ pub const App = struct {
         self.pending_attach_count = pty_ids.len;
 
         for (pty_ids) |pty_id| {
+            const cwd = self.pending_attach_cwd.get(pty_id);
+
+            // If validity doesn't match, spawn fresh instead of attaching
+            if (!validity_matches) {
+                const msgid = self.state.next_msgid;
+                self.state.next_msgid += 1;
+                try self.state.pending_requests.put(msgid, .spawn);
+                try self.spawnPtyWithCwd(msgid, cwd);
+                continue;
+            }
+
             const msgid = self.state.next_msgid;
             self.state.next_msgid += 1;
-            const cwd = self.pending_attach_cwd.get(pty_id);
             try self.state.pending_requests.put(msgid, .{ .attach = .{ .pty_id = @intCast(pty_id), .cwd = cwd } });
 
             // Server expects params as array: [pty_id]
@@ -1838,6 +1893,46 @@ pub const App = struct {
 
             try self.sendDirect(encoded);
         }
+    }
+
+    fn extractPtyValidityFromJson(allocator: std.mem.Allocator, json: []const u8) ?i64 {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return null;
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return null;
+        const validity_val = parsed.value.object.get("pty_validity") orelse return null;
+        if (validity_val != .integer) return null;
+        return validity_val.integer;
+    }
+
+    fn spawnPtyWithCwd(self: *App, msgid: u32, cwd: ?[]const u8) !void {
+        const ws = try vaxis.Tty.getWinsize(self.tty.fd);
+
+        var env_map = try std.process.getEnvMap(self.allocator);
+        defer env_map.deinit();
+
+        var env_array = std.ArrayList(msgpack.Value).empty;
+        defer env_array.deinit(self.allocator);
+        var env_it = env_map.iterator();
+        while (env_it.next()) |entry| {
+            const env_str = try std.fmt.allocPrint(self.allocator, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try env_array.append(self.allocator, .{ .string = env_str });
+        }
+
+        const param_count: usize = if (cwd != null) 5 else 4;
+        var params_kv = try self.allocator.alloc(msgpack.Value.KeyValue, param_count);
+        defer self.allocator.free(params_kv);
+        params_kv[0] = .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = ws.rows } };
+        params_kv[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = ws.cols } };
+        params_kv[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = true } };
+        params_kv[3] = .{ .key = .{ .string = "env" }, .value = .{ .array = env_array.items } };
+        if (cwd) |c| {
+            params_kv[4] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = c } };
+        }
+        const params_val = msgpack.Value{ .map = params_kv };
+        const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "spawn_pty", params_val });
+        try self.sendDirect(msg);
+        self.allocator.free(msg);
     }
 
     fn onSendComplete(_: *io.Loop, completion: io.Completion) anyerror!void {
@@ -2209,6 +2304,9 @@ pub const App = struct {
                             .color_query => |query| {
                                 try app.handleColorQuery(query);
                             },
+                            .server_info => {
+                                try app.onServerInfoReceived();
+                            },
                             .none => {},
                         }
 
@@ -2310,6 +2408,10 @@ pub const App = struct {
         const json = try self.ui.getStateJson(&cwdLookup, self);
         defer self.allocator.free(json);
 
+        // Inject pty_validity into the JSON
+        const final_json = try self.injectPtyValidity(json);
+        defer self.allocator.free(final_json);
+
         const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
         const state_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions" });
         defer self.allocator.free(state_dir);
@@ -2337,8 +2439,43 @@ pub const App = struct {
         const file = try std.fs.createFileAbsolute(path, .{});
         defer file.close();
 
-        try file.writeAll(json);
+        try file.writeAll(final_json);
         log.info("Session saved to {s}", .{path});
+    }
+
+    fn injectPtyValidity(self: *App, json: []const u8) ![]u8 {
+        const validity = self.state.pty_validity orelse {
+            return self.allocator.dupe(u8, json);
+        };
+
+        // Simple approach: find the opening brace and inject pty_validity right after
+        // JSON from Lua is always a top-level object starting with '{'
+        if (json.len < 2 or json[0] != '{') {
+            return self.allocator.dupe(u8, json);
+        }
+
+        // Build: {"pty_validity":12345,<rest of original json without leading brace>
+        var result = std.ArrayList(u8).empty;
+        errdefer result.deinit(self.allocator);
+
+        try result.appendSlice(self.allocator, "{\"pty_validity\":");
+        var buf: [32]u8 = undefined;
+        const validity_str = std.fmt.bufPrint(&buf, "{d}", .{validity}) catch unreachable;
+        try result.appendSlice(self.allocator, validity_str);
+
+        // If original has content after '{', add comma and append rest
+        if (json.len > 2) {
+            // Check if there's content after the opening brace
+            const rest = std.mem.trimLeft(u8, json[1..], " \t\n\r");
+            if (rest.len > 0 and rest[0] != '}') {
+                try result.append(self.allocator, ',');
+            }
+            try result.appendSlice(self.allocator, json[1..]);
+        } else {
+            try result.append(self.allocator, '}');
+        }
+
+        return result.toOwnedSlice(self.allocator);
     }
 
     pub fn loadSession(self: *App, name: []const u8) !void {
