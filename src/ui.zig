@@ -535,7 +535,6 @@ pub const UI = struct {
         "embers",
         "ladders",
         "naianasha",
-        "window",
         "saudade",
         // Vaxis series
         "sonny",
