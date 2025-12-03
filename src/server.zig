@@ -1599,6 +1599,19 @@ const Client = struct {
             }
 
             pty_instance.terminal_mutex.unlock();
+
+            // Send full redraw to client so the resized terminal content is visible
+            // immediately, without waiting for the child process to produce output
+            const msg = buildRedrawMessageFromPty(self.server.allocator, pty_instance, .full) catch |err| {
+                log.warn("resize_pty: failed to build redraw message: {}", .{err});
+                return;
+            };
+            defer self.server.allocator.free(msg);
+
+            self.server.sendRedraw(self.server.loop, pty_instance, msg, self) catch |err| {
+                log.warn("resize_pty: failed to send redraw: {}", .{err});
+            };
+
             log.info("resize_pty: completed for pty={}", .{pty_id});
         } else {
             log.warn("resize_pty notification: PTY {} not found", .{pty_id});
