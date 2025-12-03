@@ -43,6 +43,7 @@ local prise = require("prise")
 ---@class Command
 ---@field name string
 ---@field action fun()
+---@field shortcut? string
 
 -- Powerline symbols
 local POWERLINE_SYMBOLS = {
@@ -780,11 +781,15 @@ local function move_focus(direction)
     end
 end
 
+-- Platform-dependent key prefix for shortcuts
+local key_prefix = prise.platform == "macos" and "󰘳 +k" or "Super+k"
+
 ---Command palette commands
 ---@type Command[]
 local commands = {
     {
         name = "Split Horizontal",
+        shortcut = key_prefix .. " v",
         action = function()
             local pty = get_focused_pty()
             state.pending_split = { direction = "row" }
@@ -793,6 +798,7 @@ local commands = {
     },
     {
         name = "Split Vertical",
+        shortcut = key_prefix .. " s",
         action = function()
             local pty = get_focused_pty()
             state.pending_split = { direction = "col" }
@@ -801,6 +807,7 @@ local commands = {
     },
     {
         name = "Split Auto",
+        shortcut = key_prefix .. " Enter",
         action = function()
             local pty = get_focused_pty()
             if pty then
@@ -816,30 +823,35 @@ local commands = {
     },
     {
         name = "Focus Left",
+        shortcut = key_prefix .. " h",
         action = function()
             move_focus("left")
         end,
     },
     {
         name = "Focus Right",
+        shortcut = key_prefix .. " l",
         action = function()
             move_focus("right")
         end,
     },
     {
         name = "Focus Up",
+        shortcut = key_prefix .. " k",
         action = function()
             move_focus("up")
         end,
     },
     {
         name = "Focus Down",
+        shortcut = key_prefix .. " j",
         action = function()
             move_focus("down")
         end,
     },
     {
         name = "Close Pane",
+        shortcut = key_prefix .. " w",
         action = function()
             local root = get_active_root()
             local path = state.focused_id and find_node_path(root, state.focused_id)
@@ -855,6 +867,7 @@ local commands = {
     },
     {
         name = "Toggle Zoom",
+        shortcut = key_prefix .. " z",
         action = function()
             if state.zoomed_pane_id then
                 state.zoomed_pane_id = nil
@@ -866,6 +879,7 @@ local commands = {
     },
     {
         name = "New Tab",
+        shortcut = key_prefix .. " t",
         action = function()
             local pty = get_focused_pty()
             state.pending_new_tab = true
@@ -874,12 +888,14 @@ local commands = {
     },
     {
         name = "Close Tab",
+        shortcut = key_prefix .. " c",
         action = function()
             close_current_tab()
         end,
     },
     {
         name = "Next Tab",
+        shortcut = key_prefix .. " n",
         action = function()
             if #state.tabs > 1 then
                 local next_idx = state.active_tab % #state.tabs + 1
@@ -889,6 +905,7 @@ local commands = {
     },
     {
         name = "Previous Tab",
+        shortcut = key_prefix .. " p",
         action = function()
             if #state.tabs > 1 then
                 local prev_idx = (state.active_tab - 2 + #state.tabs) % #state.tabs + 1
@@ -898,12 +915,14 @@ local commands = {
     },
     {
         name = "Detach Session",
+        shortcut = key_prefix .. " d",
         action = function()
             prise.detach("default")
         end,
     },
     {
         name = "Quit",
+        shortcut = key_prefix .. " q",
         action = function()
             prise.quit()
         end,
@@ -1072,7 +1091,7 @@ function M.update(event)
             return
         end
 
-        -- Handle pending command mode (after Ctrl+b)
+        -- Handle pending command mode (after Super/Cmd+k)
         if state.pending_command then
             local handled = false
             local k = event.data.key
@@ -1395,6 +1414,22 @@ local function render_node(node, force_unfocused)
     end
 end
 
+---Format a command palette item with name and right-aligned shortcut
+---@param name string
+---@param shortcut? string
+---@param width number
+---@return string
+local function format_palette_item(name, shortcut, width)
+    if not shortcut then
+        return name
+    end
+    local padding = width - #name - #shortcut
+    if padding < 2 then
+        padding = 2
+    end
+    return name .. string.rep(" ", padding) .. shortcut
+end
+
 ---Build the command palette overlay
 ---@return table?
 local function build_palette()
@@ -1409,9 +1444,11 @@ local function build_palette()
         table.insert(filtered, { name = "No matches" })
     end
     prise.log.debug("build_palette: filtered count=" .. #filtered)
+
+    local palette_width = 56 -- inner width (60 - 4 for padding)
     local items = {}
     for _, cmd in ipairs(filtered) do
-        table.insert(items, cmd.name)
+        table.insert(items, format_palette_item(cmd.name, cmd.shortcut, palette_width))
     end
 
     local palette_style = { bg = THEME.bg1, fg = THEME.fg_bright }

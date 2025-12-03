@@ -322,6 +322,16 @@ pub const UI = struct {
 
         lua.setField(-2, "log");
 
+        // Register platform
+        const platform = switch (@import("builtin").os.tag) {
+            .macos => "macos",
+            .linux => "linux",
+            .windows => "windows",
+            else => "unknown",
+        };
+        _ = lua.pushString(platform);
+        lua.setField(-2, "platform");
+
         registerTimerMetatable(lua);
 
         return 1;
