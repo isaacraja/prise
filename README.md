@@ -7,24 +7,24 @@ Prise is a terminal multiplexer targeted at modern terminals.
 1.  **Modern Terminal Features**: This is a core tenet. Terminals that do not
     provide the base level of modern features will not be supported; prise will
 refuse to start in such environments.
-2.  **High-Performance Community Vibe Coding**: Prise serves as an experiment in
-    collaborative, high-performance software development driven by "vibe coding"
-and AI assistance. Together, we can vibe code high performance software.
+2.  **High-Performance Agentic Development**: Prise serves as an experiment in
+    collaborative, high-performance software development driven by agentic coding
+and AI assistance. Together, we can build high performance software with AI agents.
 3.  **Extensibility**: Extensibility is at the core of the UI. The user
     interface is designed to be fully replaceable through configuration or by
 using a third-party client.
 
-## Vibe Coding
+## Agentic Coding
 
 <p align="center">
-  <img src="assets/vibe_coding.jpg" alt="Vibe Coding" />
+  <img src="assets/vibe_coding.jpg" alt="Captain Falcon yelling about software development methodologies" />
 </p>
 
 **Core Thesis**: High-performance software is the result of quality engineering.
 
-Prise is built on a solid foundation of `libghostty`, `libvaxis`, and Lua. While these tools provide an excellent starting point, they do not guarantee success—it is still entirely possible to build bad software with good tools. We believe that **vibe coding**—leveraging AI assistance to amplify engineering capabilities—is capable of consistently producing the quality software we demand.
+Prise is built on a solid foundation of `libghostty`, `libvaxis`, and Lua. While these tools provide an excellent starting point, they do not guarantee success—it is still entirely possible to build bad software with good tools. We believe that **agentic coding**—leveraging AI agents to amplify engineering capabilities—is capable of consistently producing the quality software we demand.
 
-Prise is a vibe coded project. Contributions are welcome, but preference is given to AI-developed code.
+Prise is an agentic coded project. Contributions are welcome, but preference is given to AI-developed code.
 
 *   Sharing of AI conversation threads is preferred when submitting contributions, even if those threads did not directly result in the final Pull Request.
 *   If you cannot afford paid AI tools, check out [Amp's free mode](https://ampcode.com).
