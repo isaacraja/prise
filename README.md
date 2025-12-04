@@ -22,7 +22,7 @@ using a third-party client.
 
 **Core Thesis**: High-performance software is the result of quality engineering.
 
-Prise is built on a solid foundation of `libghostty`, `libvaxis`, and Lua. While these tools provide an excellent starting point, they do not guarantee success—it is still entirely possible to build bad software with good tools. We believe that **agentic coding**—leveraging AI agents to amplify engineering capabilities—is capable of consistently producing the quality software we demand.
+Prise is built on a solid foundation of `libghostty`, `libvaxis`, and Lua. While these tools provide an excellent starting point, they do not guarantee success—it is still entirely possible to build bad software with good tools. **Agentic coding**—leveraging AI agents to amplify engineering capabilities—*is* capable of consistently producing the quality software this project demands.
 
 Prise is an agentic coded project. Contributions are welcome. Show me your vibes.
 
