@@ -320,13 +320,17 @@ fn getSessionsDir(allocator: std.mem.Allocator) !struct { dir: std.fs.Dir, path:
 }
 
 fn listSessions(allocator: std.mem.Allocator) !void {
-    var buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&buf);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&stdout_buf);
     defer stdout.interface.flush() catch {};
+
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr = std.fs.File.stderr().writer(&stderr_buf);
+    defer stderr.interface.flush() catch {};
 
     const result = getSessionsDir(allocator) catch |err| {
         if (err == error.NoSessionsFound) {
-            try stdout.interface.print("No sessions found.\n", .{});
+            try stderr.interface.print("No sessions found.\n", .{});
             return;
         }
         return err;
@@ -348,7 +352,7 @@ fn listSessions(allocator: std.mem.Allocator) !void {
     }
 
     if (count == 0) {
-        try stdout.interface.print("No sessions found.\n", .{});
+        try stderr.interface.print("No sessions found.\n", .{});
     }
 }
 
