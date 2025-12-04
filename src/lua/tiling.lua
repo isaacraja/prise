@@ -524,7 +524,7 @@ local function close_current_tab()
                 pane.pty:close()
             end
         end
-        prise.quit()
+        prise.detach(prise.get_session_name())
         return
     end
 
@@ -1024,7 +1024,7 @@ local commands = {
         name = "Detach Session",
         shortcut = key_prefix .. " d",
         action = function()
-            prise.detach("default")
+            prise.detach(prise.get_session_name())
         end,
     },
     {
@@ -1037,7 +1037,7 @@ local commands = {
         name = "Quit",
         shortcut = key_prefix .. " q",
         action = function()
-            prise.detach()
+            prise.detach(prise.get_session_name())
         end,
     },
     {
@@ -1474,7 +1474,7 @@ function M.update(event)
                 end
             elseif k == "q" then
                 -- Quit
-                prise.quit()
+                prise.detach(prise.get_session_name())
                 handled = true
             elseif k == "z" then
                 -- Toggle zoom

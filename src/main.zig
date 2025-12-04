@@ -87,6 +87,7 @@ pub fn main() !void {
     const socket_path = try std.fmt.bufPrint(&socket_buffer, "/tmp/prise-{d}.sock", .{uid});
 
     const attach_session = try parseArgs(allocator, socket_path) orelse return;
+    defer if (attach_session) |s| allocator.free(s);
     try runClient(allocator, socket_path, attach_session);
 }
 
@@ -198,7 +199,7 @@ fn handleSessionCommand(allocator: std.mem.Allocator, args: *std.process.ArgIter
         return null;
     } else if (std.mem.eql(u8, subcmd, "delete")) {
         const name = args.next() orelse {
-            log.err("Usage: prise session delete <name>", .{});
+            std.fs.File.stderr().writeAll("Missing session name. Usage: prise session delete <name>\n") catch {};
             return error.MissingArgument;
         };
         try deleteSession(allocator, name);

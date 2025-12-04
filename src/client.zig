@@ -366,8 +366,9 @@ pub const ClientLogic = struct {
                 log.info("{s}", .{s});
                 return .none;
             },
+            .nil => return .none,
             else => {
-                log.info("Unknown result type", .{});
+                log.info("Unknown result type: {}", .{result});
                 return .none;
             },
         };
@@ -718,6 +719,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        log.info("deinit: starting", .{});
         self.ui.deinit();
         self.state.should_quit = true;
 
@@ -1858,6 +1860,7 @@ pub const App = struct {
         // After receiving server info, proceed with spawn or session attach
         if (self.attach_session) |session_name| {
             // Use the attached session name
+            log.info("Setting current_session_name to: {s}", .{session_name});
             self.current_session_name = try self.allocator.dupe(u8, session_name);
             try self.startSessionAttach(session_name);
         } else {
@@ -2403,18 +2406,38 @@ pub const App = struct {
                                 // Clean up all surfaces before closing
                                 var surface_it = app.surfaces.valueIterator();
                                 while (surface_it.next()) |surface| {
+                                    log.info("Cleaning up surface", .{});
                                     surface.*.deinit();
                                     app.allocator.destroy(surface.*);
                                 }
+                                log.info("Cleared surfaces", .{});
                                 app.surfaces.clearRetainingCapacity();
 
                                 app.state.should_quit = true;
+
+                                // Cancel pending tasks before closing fd
+                                if (app.recv_task) |*task| {
+                                    task.cancel(l) catch {};
+                                    app.recv_task = null;
+                                }
+                                if (app.render_timer) |*task| {
+                                    task.cancel(l) catch {};
+                                    app.render_timer = null;
+                                }
+                                if (app.autosave_timer) |*task| {
+                                    task.cancel(l) catch {};
+                                    app.autosave_timer = null;
+                                }
+
+                                log.info("Closing connection", .{});
                                 if (app.connected) {
                                     posix.close(app.fd);
                                     app.connected = false;
                                 }
                                 // Wake up TTY thread so it can exit
+                                log.info("Waking TTY thread", .{});
                                 app.vx.deviceStatusReport(app.tty.writer()) catch {};
+                                log.info("Returning from detach handler", .{});
                                 return;
                             },
                             .color_query => |query| {
