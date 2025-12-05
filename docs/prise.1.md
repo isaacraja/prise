@@ -76,4 +76,4 @@ Manage sessions.
 
 # SEE ALSO
 
-**prise**(5), **prise**(7)
+[prise(5)](prise.5.html), [prise(7)](prise.7.html)

@@ -150,6 +150,8 @@ pub fn build(b: *std.Build) void {
     const man_step = b.step("man", "Generate man pages");
     const man_sources = .{
         .{ "prise.1.md", "prise.1", "1" },
+        .{ "prise.5.md", "prise.5", "5" },
+        .{ "prise.7.md", "prise.7", "7" },
     };
     inline for (man_sources) |entry| {
         const md_file, const man_file, const section = entry;
