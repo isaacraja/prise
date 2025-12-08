@@ -2374,4 +2374,16 @@ function M.set_state(saved, pty_lookup)
     prise.request_frame()
 end
 
+-- Export internal functions for testing
+M._test = {
+    matches_keybind = matches_keybind,
+    is_pane = is_pane,
+    is_split = is_split,
+    collect_panes = collect_panes,
+    find_node_path = find_node_path,
+    get_first_leaf = get_first_leaf,
+    get_last_leaf = get_last_leaf,
+    format_palette_item = format_palette_item,
+}
+
 return M

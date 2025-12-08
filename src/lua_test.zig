@@ -13,12 +13,8 @@ fn runLuaTest(lua: *ziglua.Lua, file: [:0]const u8) !void {
     };
 }
 
-test "lua utils" {
-    const allocator = std.testing.allocator;
-
+fn setupLua(allocator: std.mem.Allocator) !*ziglua.Lua {
     var lua = try ziglua.Lua.init(allocator);
-    defer lua.deinit();
-
     lua.openLibs();
 
     // Set up package.path to find our Lua modules
@@ -27,6 +23,23 @@ test "lua utils" {
     lua.setField(-2, "path");
     lua.pop(1);
 
-    // Run the test file
-    try runLuaTest(lua, "src/lua/test_utils.lua");
+    return lua;
+}
+
+test "lua utils" {
+    var lua = try setupLua(std.testing.allocator);
+    defer lua.deinit();
+    try runLuaTest(lua, "src/lua/utils_test.lua");
+}
+
+test "lua prise" {
+    var lua = try setupLua(std.testing.allocator);
+    defer lua.deinit();
+    try runLuaTest(lua, "src/lua/prise_test.lua");
+}
+
+test "lua tiling" {
+    var lua = try setupLua(std.testing.allocator);
+    defer lua.deinit();
+    try runLuaTest(lua, "src/lua/tiling_test.lua");
 }
