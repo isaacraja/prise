@@ -1,12 +1,74 @@
 {
   "$schema": "https://raw.githubusercontent.com/LuaLS/vscode-lua/master/setting/schema.json",
+
+  "runtime": {
+    "version": "Lua 5.4",
+    "special": {}
+  },
+
   "workspace": {
     "library": [
-      "/Users/tim/repos/prise/src/lua/types"
+      "types"
     ],
-    "checkThirdParty": false
+    "checkThirdParty": false,
+    "useGitIgnore": true
   },
-  "runtime": {
-    "version": "Lua 5.4"
+
+  "typechecking": {
+    "enable": true,
+    "strictNilCheck": true,
+    "strictUnionCheck": true,
+    "strictGenericCheck": true,
+    "narrowUnion": true
+  },
+
+  "diagnostics": {
+    "enable": true,
+
+    "globals": [],
+
+    "groupSeverity": {
+      "type-check": "Error",
+      "unused": "Error",
+      "redefined": "Error",
+      "strict": "Error",
+      "strong": "Error",
+      "global": "Error",
+      "unbalanced": "Error"
+    },
+
+    "severity": {
+      "undefined-global": "Error!",
+      "undefined-field": "Error!",
+      "missing-fields": "Error!",
+      "assign-type-mismatch": "Error!",
+      "param-type-mismatch": "Error!",
+      "return-type-mismatch": "Error!",
+      "need-check-nil": "Error!",
+      "redefined-local": "Error!",
+      "unused-local": "Error!",
+      "unused-function": "Error!",
+      "unused-vararg": "Error!",
+      "discard-returns": "Error!"
+    },
+
+    "neededFileStatus": {
+      "undefined-global": "Any!",
+      "undefined-field": "Any!",
+      "missing-fields": "Any!",
+      "assign-type-mismatch": "Any!",
+      "param-type-mismatch": "Any!",
+      "return-type-mismatch": "Any!",
+      "need-check-nil": "Any!",
+      "redefined-local": "Any!",
+      "unused-local": "Any!",
+      "unused-function": "Any!",
+      "unused-vararg": "Any!",
+      "discard-returns": "Any!"
+    },
+
+    "unusedLocalExclude": [
+      "^_$"
+    ]
   }
 }

@@ -147,6 +147,15 @@ pub fn build(b: *std.Build) void {
     const stylua = b.addSystemCommand(&.{ "stylua", "src/lua" });
     fmt_step.dependOn(&stylua.step);
 
+    const lua_typecheck = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\output=$(lua-language-server --check src/lua --configpath src/lua/.luarc.json 2>&1)
+        \\status=$?
+        \\if [ $status -ne 0 ]; then echo "$output"; exit $status; fi
+        ,
+    });
+    b.getInstallStep().dependOn(&lua_typecheck.step);
+
     // mdman - markdown to man page converter
     const mdman_mod = b.createModule(.{
         .root_source_file = b.path("tools/mdman/main.zig"),
