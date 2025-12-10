@@ -1737,7 +1737,7 @@ function M.update(event)
                 handled = true
             elseif k >= "1" and k <= "9" then
                 -- Switch to tab N
-                local idx = math.tointeger(k)
+                local idx = math.tointeger(tonumber(k))
                 if idx and idx <= #state.tabs then
                     set_active_tab_index(idx)
                 end
