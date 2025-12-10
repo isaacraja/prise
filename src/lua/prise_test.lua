@@ -5,10 +5,18 @@ local prise = require("prise")
 local function mock_pty()
     ---@type Pty
     local pty = {
-        id = function() return 1 end,
-        title = function() return "test" end,
-        cwd = function() return "/tmp" end,
-        size = function() return { rows = 24, cols = 80, width_px = 0, height_px = 0 } end,
+        id = function()
+            return 1
+        end,
+        title = function()
+            return "test"
+        end,
+        cwd = function()
+            return "/tmp"
+        end,
+        size = function()
+            return { rows = 24, cols = 80, width_px = 0, height_px = 0 }
+        end,
         send_key = function() end,
         send_mouse = function() end,
         send_paste = function() end,
@@ -24,8 +32,12 @@ end
 local function mock_text_input()
     ---@type TextInput
     local input = {
-        id = function() return 1 end,
-        text = function() return "" end,
+        id = function()
+            return 1
+        end,
+        text = function()
+            return ""
+        end,
         insert = function() end,
         delete_backward = function() end,
         delete_forward = function() end,

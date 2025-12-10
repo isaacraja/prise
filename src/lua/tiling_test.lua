@@ -4,31 +4,31 @@ package.loaded["prise"] = {
     Terminal = function(opts)
         return { type = "terminal", pty = opts.pty }
     end,
-    Text = function(opts)
+    Text = function(_)
         return { type = "text" }
     end,
-    Column = function(opts)
+    Column = function(_)
         return { type = "column" }
     end,
-    Row = function(opts)
+    Row = function(_)
         return { type = "row" }
     end,
-    Stack = function(opts)
+    Stack = function(_)
         return { type = "stack" }
     end,
-    Positioned = function(opts)
+    Positioned = function(_)
         return { type = "positioned" }
     end,
-    TextInput = function(opts)
+    TextInput = function(_)
         return { type = "text_input" }
     end,
-    List = function(opts)
+    List = function(_)
         return { type = "list" }
     end,
-    Box = function(opts)
+    Box = function(_)
         return { type = "box" }
     end,
-    Padding = function(opts)
+    Padding = function(_)
         return { type = "padding" }
     end,
     gwidth = function(s)
