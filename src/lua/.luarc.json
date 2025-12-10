@@ -63,7 +63,8 @@
       "missing-return-value": "Error!",
       "redundant-return-value": "Error!",
       "redundant-value": "Error!",
-      "deprecated": "Error!"
+      "deprecated": "Error!",
+      "incomplete-signature-doc": "Error!"
     },
 
     "neededFileStatus": {
@@ -90,7 +91,8 @@
       "missing-return-value": "Any!",
       "redundant-return-value": "Any!",
       "redundant-value": "Any!",
-      "deprecated": "Any!"
+      "deprecated": "Any!",
+      "incomplete-signature-doc": "Any!"
     },
 
     "unusedLocalExclude": [
