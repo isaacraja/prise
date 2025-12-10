@@ -296,6 +296,7 @@ local function get_active_root()
 end
 
 ---Forward declaration for find_node_path
+---@type fun(current: Node?, target_id: number, path: Node[]?): Node[]?
 local find_node_path
 
 ---Find which tab contains a pane by id
@@ -483,6 +484,7 @@ local function remove_pane_recursive(node, id)
 
         -- If only one child remains, promote it
         if #new_children == 1 then
+            ---@type Node
             local survivor = new_children[1]
             survivor.ratio = node.ratio -- Inherit ratio from parent
             return survivor, closest_id
@@ -511,6 +513,7 @@ local function get_auto_split_direction()
     local pty = get_focused_pty()
     if pty then
         local size = pty:size()
+        ---@type boolean
         local wider
         if size.width_px > 0 and size.height_px > 0 then
             wider = size.width_px > size.height_px
@@ -760,16 +763,19 @@ local function get_pane_position()
     end
 
     local index = 0
+    ---@type number
     local found_index = 1
 
-    local function walk(node)
-        if is_pane(node) then
+    ---@param n Node
+    local function walk(n)
+        if is_pane(n) then
             index = index + 1
-            if node.id == state.focused_id then
+            if n.id == state.focused_id then
                 found_index = index
             end
-        elseif is_split(node) then
-            for _, child in ipairs(node.children) do
+        elseif is_split(n) then
+            ---@cast n Split
+            for _, child in ipairs(n.children) do
                 walk(child)
             end
         end
@@ -781,6 +787,7 @@ end
 
 ---Serialize a node tree to a table with pty_ids instead of userdata
 ---@param node? Node
+---@param cwd_lookup? fun(pty_id: number): string?
 ---@return table?
 local function serialize_node(node, cwd_lookup)
     if not node then
@@ -788,6 +795,7 @@ local function serialize_node(node, cwd_lookup)
     end
     if is_pane(node) then
         local pty_id = node.pty:id()
+        ---@type string?
         local cwd = nil
         if cwd_lookup then
             cwd = cwd_lookup(pty_id)
@@ -836,6 +844,7 @@ local function deserialize_node(saved, pty_lookup)
             ratio = saved.ratio,
         }
     elseif saved.type == "split" then
+        ---@type Node[]
         local children = {}
         for _, child in ipairs(saved.children) do
             local restored = deserialize_node(child, pty_lookup)
@@ -846,6 +855,7 @@ local function deserialize_node(saved, pty_lookup)
         if #children == 0 then
             return nil
         elseif #children == 1 then
+            ---@type Node
             local survivor = children[1]
             survivor.ratio = saved.ratio
             return survivor
@@ -1019,6 +1029,7 @@ local function move_focus(direction)
 
     if sibling_node then
         -- Found a sibling tree/pane. Find the closest leaf.
+        ---@type Pane?
         local target_leaf
         if forward then
             target_leaf = get_first_leaf(sibling_node)
@@ -1425,7 +1436,9 @@ end
 function M.update(event)
     if event.type == "pty_attach" then
         prise.log.info("Lua: pty_attach received")
+        ---@type Pty
         local pty = event.data.pty
+        ---@type Pane
         local new_pane = { type = "pane", pty = pty, id = pty:id() }
         local old_focused_id = state.focused_id
 
@@ -1434,6 +1447,7 @@ function M.update(event)
             state.pending_new_tab = false
             local tab_id = state.next_tab_id
             state.next_tab_id = tab_id + 1
+            ---@type Tab
             local new_tab = {
                 id = tab_id,
                 root = new_pane,
@@ -1445,6 +1459,7 @@ function M.update(event)
             -- First terminal - create first tab
             local tab_id = state.next_tab_id
             state.next_tab_id = tab_id + 1
+            ---@type Tab
             local new_tab = {
                 id = tab_id,
                 root = new_pane,
@@ -1489,6 +1504,7 @@ function M.update(event)
     elseif event.type == "key_press" then
         -- Handle command palette
         if state.palette.visible then
+            ---@type string
             local k = event.data.key
             local filtered = filter_commands(state.palette.input:text())
 
@@ -2362,6 +2378,7 @@ function M.view()
     return main_ui
 end
 
+---@param cwd_lookup? fun(pty_id: number): string?
 ---@return table
 function M.get_state(cwd_lookup)
     -- Serialize all tabs
