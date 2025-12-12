@@ -1301,9 +1301,15 @@ const Client = struct {
                 pty_instance.terminal_mutex.unlock();
                 return;
             };
-            pty_instance.terminal_mutex.unlock();
 
             const encoded = writer.buffered();
+            if (encoded.len > 0 and !key.key.modifier()) {
+                pty_instance.terminal.scrollViewport(.bottom) catch |err| {
+                    log.err("Failed to scroll viewport: {}", .{err});
+                };
+            }
+            pty_instance.terminal_mutex.unlock();
+
             if (encoded.len > 0) {
                 _ = posix.write(pty_instance.process.master, encoded) catch |err| {
                     log.err("Write to PTY failed: {}", .{err});
