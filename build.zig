@@ -104,7 +104,7 @@ pub fn build(b: *std.Build) void {
         _ = service.add("prise.service", service_content);
         b.getInstallStep().dependOn(&b.addInstallDirectory(.{
             .source_dir = service.getDirectory(),
-            .install_dir = .{ .custom = "lib/systemd/user" },
+            .install_dir = .{ .custom = "share/systemd/user" },
             .install_subdir = "",
         }).step);
     }
@@ -267,17 +267,11 @@ pub fn build(b: *std.Build) void {
             "sh",
             "-c",
             \\set -e
-            \\SERVICE_SRC="$1/lib/systemd/user/prise.service"
-            \\SERVICE_DST="$HOME/.config/systemd/user/prise.service"
-            \\mkdir -p "$HOME/.config/systemd/user"
-            \\ln -sf "$SERVICE_SRC" "$SERVICE_DST"
             \\systemctl --user daemon-reload
             \\systemctl --user enable --now prise.service
             \\echo "✓ prise server enabled and started"
             ,
-            "--",
         });
-        enable_linux.addDirectoryArg(.{ .cwd_relative = b.install_prefix });
         enable_service_step.dependOn(&enable_linux.step);
     }
     enable_service_step.dependOn(b.getInstallStep());
