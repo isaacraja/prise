@@ -3358,3 +3358,247 @@ test "render Text - CJK centered" {
 
     try tui_test.expectAsciiEqual("   你好   ", ascii);
 }
+
+// ============================================================================
+// Text Edge Case Tests
+// ============================================================================
+
+test "layout Text - long word exceeds container with word wrap" {
+    // Word wrap with a word longer than max_width should break character-by-character
+    var spans = [_]Text.Span{.{ .text = "Supercalifragilistic", .style = .{} }};
+
+    var w: Widget = .{
+        .kind = .{ .text = .{ .spans = &spans, .wrap = .word } },
+    };
+
+    const size = w.layout(boundsConstraints(5, 10));
+
+    // Should wrap into multiple lines
+    try std.testing.expectEqual(@as(u16, 5), size.width);
+    try std.testing.expectEqual(@as(u16, 4), size.height); // 20 chars / 5 = 4 lines
+}
+
+test "render Text - long word exceeds container with word wrap" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "ABCDEFGH", .style = .{} }};
+
+    var w: Widget = .{
+        .kind = .{ .text = .{ .spans = &spans, .wrap = .word } },
+    };
+
+    _ = w.layout(boundsConstraints(3, 4));
+
+    var screen = try tui_test.createScreen(allocator, 3, 4);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 3, 4);
+    defer allocator.free(ascii);
+
+    // Word wrap falls back to char wrap for long words
+    try tui_test.expectAsciiEqual(
+        \\ABC
+        \\DEF
+        \\GH 
+        \\   
+    , ascii);
+}
+
+test "layout Text - text exactly fills width" {
+    var spans = [_]Text.Span{.{ .text = "12345", .style = .{} }};
+
+    var w: Widget = .{
+        .kind = .{ .text = .{ .spans = &spans } },
+    };
+
+    const size = w.layout(boundsConstraints(5, 1));
+
+    try std.testing.expectEqual(@as(u16, 5), size.width);
+    try std.testing.expectEqual(@as(u16, 1), size.height);
+}
+
+test "render Text - text exactly fills width" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "ABCDE", .style = .{} }};
+
+    var w: Widget = .{
+        .kind = .{ .text = .{ .spans = &spans } },
+    };
+
+    _ = w.layout(boundsConstraints(5, 1));
+
+    var screen = try tui_test.createScreen(allocator, 5, 1);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 5, 1);
+    defer allocator.free(ascii);
+
+    try tui_test.expectAsciiEqual("ABCDE", ascii);
+}
+
+test "layout Text - whitespace only" {
+    var spans = [_]Text.Span{.{ .text = "   ", .style = .{} }};
+
+    var w: Widget = .{
+        .kind = .{ .text = .{ .spans = &spans } },
+    };
+
+    const size = w.layout(boundsConstraints(10, 1));
+
+    try std.testing.expectEqual(@as(u16, 3), size.width);
+    try std.testing.expectEqual(@as(u16, 1), size.height);
+}
+
+test "render Text - whitespace only" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "   ", .style = .{} }};
+
+    var w: Widget = .{
+        .kind = .{ .text = .{ .spans = &spans } },
+    };
+
+    _ = w.layout(boundsConstraints(5, 1));
+
+    var screen = try tui_test.createScreen(allocator, 5, 1);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 5, 1);
+    defer allocator.free(ascii);
+
+    try tui_test.expectAsciiEqual("     ", ascii);
+}
+
+test "layout Text - empty span in middle" {
+    var spans = [_]Text.Span{
+        .{ .text = "Hello", .style = .{} },
+        .{ .text = "", .style = .{} },
+        .{ .text = "World", .style = .{} },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .text = .{ .spans = &spans } },
+    };
+
+    const size = w.layout(boundsConstraints(20, 1));
+
+    try std.testing.expectEqual(@as(u16, 10), size.width);
+    try std.testing.expectEqual(@as(u16, 1), size.height);
+}
+
+test "render Text - empty span in middle" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{
+        .{ .text = "AB", .style = .{} },
+        .{ .text = "", .style = .{} },
+        .{ .text = "CD", .style = .{} },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .text = .{ .spans = &spans } },
+    };
+
+    _ = w.layout(boundsConstraints(10, 1));
+
+    var screen = try tui_test.createScreen(allocator, 10, 1);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 10, 1);
+    defer allocator.free(ascii);
+
+    try tui_test.expectAsciiEqual("ABCD      ", ascii);
+}
+
+test "layout Text - very narrow container width 1" {
+    var spans = [_]Text.Span{.{ .text = "ABC", .style = .{} }};
+
+    var w: Widget = .{
+        .kind = .{ .text = .{ .spans = &spans, .wrap = .char } },
+    };
+
+    const size = w.layout(boundsConstraints(1, 10));
+
+    try std.testing.expectEqual(@as(u16, 1), size.width);
+    try std.testing.expectEqual(@as(u16, 3), size.height);
+}
+
+test "render Text - very narrow container width 1" {
+    const allocator = std.testing.allocator;
+
+    var spans = [_]Text.Span{.{ .text = "XYZ", .style = .{} }};
+
+    var w: Widget = .{
+        .kind = .{ .text = .{ .spans = &spans, .wrap = .char } },
+    };
+
+    _ = w.layout(boundsConstraints(1, 3));
+
+    var screen = try tui_test.createScreen(allocator, 1, 3);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 1, 3);
+    defer allocator.free(ascii);
+
+    try tui_test.expectAsciiEqual(
+        \\X
+        \\Y
+        \\Z
+    , ascii);
+}
+
+test "render Text - span style preservation" {
+    const allocator = std.testing.allocator;
+
+    // Create spans with different styles
+    var spans = [_]Text.Span{
+        .{ .text = "AB", .style = .{ .fg = .{ .index = 1 } } }, // red
+        .{ .text = "CD", .style = .{ .fg = .{ .index = 2 } } }, // green
+    };
+
+    var w: Widget = .{
+        .kind = .{ .text = .{ .spans = &spans } },
+    };
+
+    _ = w.layout(boundsConstraints(10, 1));
+
+    var screen = try tui_test.createScreen(allocator, 10, 1);
+    defer screen.deinit(allocator);
+    const win = tui_test.windowFromScreen(&screen);
+
+    try w.renderTo(win, allocator);
+
+    // Verify text renders correctly
+    const ascii = try tui_test.screenToAscii(allocator, &screen, 10, 1);
+    defer allocator.free(ascii);
+    try tui_test.expectAsciiEqual("ABCD      ", ascii);
+
+    // Verify styles are preserved - check foreground colors
+    const cell_a = screen.readCell(0, 0).?;
+    const cell_b = screen.readCell(1, 0).?;
+    const cell_c = screen.readCell(2, 0).?;
+    const cell_d = screen.readCell(3, 0).?;
+
+    // First span (AB) should have index 1
+    try std.testing.expectEqual(@as(u8, 1), cell_a.style.fg.index);
+    try std.testing.expectEqual(@as(u8, 1), cell_b.style.fg.index);
+    // Second span (CD) should have index 2
+    try std.testing.expectEqual(@as(u8, 2), cell_c.style.fg.index);
+    try std.testing.expectEqual(@as(u8, 2), cell_d.style.fg.index);
+}
