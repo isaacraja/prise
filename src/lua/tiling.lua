@@ -2355,10 +2355,35 @@ local function build_tab_bar()
             close_text = close_text .. string.rep(" ", close_widget_width - close_text_width)
         end
 
-        -- Get label and calculate padding
-        local title = tab.title or tostring(i)
-        -- Always reserve space for endcaps and close widget
-        local inner_width = tab_width - endcap_width - close_widget_width
+        -- Get title: manual title, or focused pty title, or focused pty cwd
+        local title = "Terminal"
+        if tab.title then
+            title = tab.title
+        else
+            local focused_id = is_active and state.focused_id or tab.last_focused_id
+            if focused_id and tab.root then
+                local path = find_node_path(tab.root, focused_id)
+                if path then
+                    local pane = path[#path]
+                    local pty_title = pane.pty:title()
+                    if pty_title and #pty_title > 0 then
+                        title = pty_title
+                    else
+                        local cwd = pane.pty:cwd()
+                        if cwd then
+                            title = cwd:match("([^/]+)/?$") or cwd
+                        end
+                    end
+                end
+            end
+        end
+
+        -- Tab index shown on the right
+        local index_str = tostring(i)
+        local index_width = #index_str + 2 -- space + index + space
+
+        -- Always reserve space for endcaps, close widget, and index
+        local inner_width = tab_width - endcap_width - close_widget_width - index_width
         local title_width = prise.gwidth(title)
 
         -- Truncate title if needed
@@ -2367,12 +2392,19 @@ local function build_tab_bar()
             title_width = prise.gwidth(title)
         end
 
-        -- Calculate padding to center the title, ensuring exact width
+        -- Center the title
         local padding_total = inner_width - title_width
         local pad_left = math.floor(padding_total / 2)
-        local pad_right = inner_width - title_width - pad_left
+        local pad_right = padding_total - pad_left
+        if pad_left < 0 then
+            pad_left = 0
+        end
+        if pad_right < 0 then
+            pad_right = 0
+        end
 
         local label = string.rep(" ", pad_left) .. title .. string.rep(" ", pad_right)
+        local index_label = " " .. index_str .. " "
 
         -- Record close button hit region (after left endcap)
         local close_start = x_pos + 1 -- after left endcap
@@ -2392,8 +2424,8 @@ local function build_tab_bar()
 
         local tab_bg, tab_fg
         if is_active then
-            tab_bg = THEME.accent
-            tab_fg = THEME.fg_dark
+            tab_bg = THEME.bg4
+            tab_fg = THEME.fg_bright
         elseif is_hovered then
             tab_bg = THEME.bg3
             tab_fg = THEME.fg_bright
@@ -2406,8 +2438,10 @@ local function build_tab_bar()
         table.insert(segments, { text = POWERLINE_SYMBOLS.left_round, style = { fg = tab_bg, bg = THEME.bg1 } })
         -- Close widget
         table.insert(segments, { text = close_text, style = { bg = tab_bg, fg = tab_fg } })
-        -- Tab content
-        table.insert(segments, { text = label, style = { bg = tab_bg, fg = tab_fg } })
+        -- Tab content (title)
+        table.insert(segments, { text = label, style = { bg = tab_bg, fg = tab_fg, bold = is_active } })
+        -- Tab index (right side, dimmed)
+        table.insert(segments, { text = index_label, style = { bg = tab_bg, fg = THEME.fg_dim } })
         -- Right endcap
         table.insert(segments, { text = POWERLINE_SYMBOLS.right_round, style = { fg = tab_bg, bg = THEME.bg1 } })
     end
