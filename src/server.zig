@@ -116,9 +116,10 @@ const Pty = struct {
     color_queries_len: usize = 0,
     color_queries_mutex: std.Thread.Mutex = .{},
 
-    // Response queue for ordered response delivery
+    // Response queue for ordered response delivery (ring buffer with absolute slots)
     response_queue: [LIMITS.RESPONSE_QUEUE_MAX]QueuedResponse = undefined,
-    response_queue_len: usize = 0,
+    response_queue_head: usize = 0, // Next slot to flush (absolute, wraps)
+    response_queue_tail: usize = 0, // Next slot to allocate (absolute, wraps)
     response_queue_start: i64 = 0, // Timestamp when first item was queued
 
     // Track color queries sent vs responses received
@@ -309,7 +310,8 @@ const Pty = struct {
         const now_ms = std.time.milliTimestamp();
 
         // Check response queue capacity first
-        if (self.response_queue_len >= LIMITS.RESPONSE_QUEUE_MAX) {
+        const queue_len = self.response_queue_tail - self.response_queue_head;
+        if (queue_len >= LIMITS.RESPONSE_QUEUE_MAX) {
             log.warn("Response queue full, dropping color query", .{});
             return;
         }
@@ -319,11 +321,11 @@ const Pty = struct {
             return;
         }
 
-        // Allocate a slot in the response queue for this color query
-        const slot = self.response_queue_len;
-        self.response_queue[slot] = QueuedResponse.pendingColor();
-        self.response_queue_len += 1;
-        if (slot == 0) {
+        // Allocate a slot in the response queue for this color query (absolute slot)
+        const slot = self.response_queue_tail;
+        self.response_queue[slot % LIMITS.RESPONSE_QUEUE_MAX] = QueuedResponse.pendingColor();
+        self.response_queue_tail += 1;
+        if (queue_len == 0) {
             self.response_queue_start = now_ms;
         }
 
@@ -333,6 +335,9 @@ const Pty = struct {
             .response_slot = slot,
         };
         self.color_queries_len += 1;
+
+        // Signal dirty to trigger sending color queries to client
+        _ = posix.write(self.pipe_fds[1], "c") catch {};
     }
 
     /// Queue a DA1 response to be sent after all other responses are flushed.
@@ -342,7 +347,10 @@ const Pty = struct {
 
         self.da1_pending = true;
         self.da1_timestamp_ms = std.time.milliTimestamp();
-        log.debug("DA1 queued for PTY {}", .{self.id});
+
+        // Try to send immediately if queue is empty, otherwise signal dirty
+        _ = self.flushResponsesUnlocked();
+        _ = posix.write(self.pipe_fds[1], "d") catch {};
     }
 
     /// Queue a response to be sent to the PTY in order.
@@ -350,15 +358,15 @@ const Pty = struct {
         self.color_queries_mutex.lock();
         defer self.color_queries_mutex.unlock();
 
-        if (self.response_queue_len >= LIMITS.RESPONSE_QUEUE_MAX) {
+        const queue_len = self.response_queue_tail - self.response_queue_head;
+        if (queue_len >= LIMITS.RESPONSE_QUEUE_MAX) {
             log.warn("Response queue full, dropping response", .{});
             return;
         }
 
-        const slot = self.response_queue_len;
-        self.response_queue[slot] = QueuedResponse.ready(response);
-        self.response_queue_len += 1;
-        if (slot == 0) {
+        self.response_queue[self.response_queue_tail % LIMITS.RESPONSE_QUEUE_MAX] = QueuedResponse.ready(response);
+        self.response_queue_tail += 1;
+        if (queue_len == 0) {
             self.response_queue_start = std.time.milliTimestamp();
         }
     }
@@ -368,8 +376,9 @@ const Pty = struct {
         self.color_queries_mutex.lock();
         defer self.color_queries_mutex.unlock();
 
-        if (slot < self.response_queue_len) {
-            self.response_queue[slot] = QueuedResponse.ready(response);
+        // Slot must be within the current queue range (head <= slot < tail)
+        if (slot >= self.response_queue_head and slot < self.response_queue_tail) {
+            self.response_queue[slot % LIMITS.RESPONSE_QUEUE_MAX] = QueuedResponse.ready(response);
         }
     }
 
@@ -384,17 +393,17 @@ const Pty = struct {
     /// Flush responses without taking the lock (caller must hold color_queries_mutex).
     fn flushResponsesUnlocked(self: *Pty) bool {
         const now_ms = std.time.milliTimestamp();
-        const timed_out = self.response_queue_len > 0 and
+        const queue_len = self.response_queue_tail - self.response_queue_head;
+        const timed_out = queue_len > 0 and
             (now_ms - self.response_queue_start > LIMITS.COLOR_QUERY_TIMEOUT_MS);
 
-        // Flush consecutive ready responses from the front
-        var flushed: usize = 0;
-        while (flushed < self.response_queue_len) {
-            const resp = &self.response_queue[flushed];
+        // Flush consecutive ready responses from the head
+        while (self.response_queue_head < self.response_queue_tail) {
+            const resp = &self.response_queue[self.response_queue_head % LIMITS.RESPONSE_QUEUE_MAX];
             if (resp.tag == .pending_color) {
                 if (timed_out) {
                     // Skip timed-out pending responses
-                    flushed += 1;
+                    self.response_queue_head += 1;
                     continue;
                 }
                 break; // Wait for this response
@@ -403,41 +412,24 @@ const Pty = struct {
             writeAllFd(self.process.master, resp.data[0..resp.len]) catch |err| {
                 log.err("Failed to write response to PTY: {}", .{err});
             };
-            flushed += 1;
+            self.response_queue_head += 1;
         }
 
-        // Shift remaining items to front
-        if (flushed > 0) {
-            const remaining = self.response_queue_len - flushed;
-            if (remaining > 0) {
-                std.mem.copyForwards(
-                    QueuedResponse,
-                    self.response_queue[0..remaining],
-                    self.response_queue[flushed..][0..remaining],
-                );
-                // Update slot indices in color queries
-                for (self.color_queries_buf[0..self.color_queries_len]) |*cq| {
-                    if (cq.response_slot >= flushed) {
-                        cq.response_slot -= flushed;
-                    }
-                }
-            }
-            self.response_queue_len = remaining;
-            if (remaining > 0) {
-                self.response_queue_start = now_ms;
-            }
+        // Update start time if queue still has items
+        const new_queue_len = self.response_queue_tail - self.response_queue_head;
+        if (new_queue_len > 0 and new_queue_len < queue_len) {
+            self.response_queue_start = now_ms;
         }
 
         // Send DA1 if queue is empty and DA1 is pending
-        if (self.response_queue_len == 0 and self.da1_pending) {
+        if (self.da1_pending and new_queue_len == 0) {
             self.da1_pending = false;
             writeAllFd(self.process.master, "\x1b[?1;2c") catch |err| {
                 log.err("Failed to write DA1 response to PTY: {}", .{err});
             };
-            log.debug("Sent DA1 response to PTY {}", .{self.id});
         }
 
-        return self.response_queue_len > 0;
+        return new_queue_len > 0;
     }
 
     // Removed broadcast - we'll send msgpack-RPC redraw notifications instead
