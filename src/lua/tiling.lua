@@ -47,6 +47,7 @@ local utils = require("utils")
 ---@field zoomed_pane_id? number
 ---@field pending_command boolean
 ---@field timer? Timer
+---@field clock_timer? Timer
 ---@field pending_split? { direction: "row"|"col" }
 ---@field pending_new_tab? boolean
 ---@field next_split_id number
@@ -715,7 +716,12 @@ local function close_tab(idx)
                 pane.pty:close()
             end
         end
-        prise.detach(prise.get_session_name())
+        -- Cancel clock timer before exit
+        if state.clock_timer then
+            state.clock_timer:cancel()
+            state.clock_timer = nil
+        end
+        prise.exit()
         return
     end
 
@@ -781,6 +787,11 @@ local function remove_pane_by_id(id)
         -- Tab is now empty, remove it
         if #state.tabs == 1 then
             table.remove(state.tabs, tab_idx)
+            -- Cancel clock timer before exit
+            if state.clock_timer then
+                state.clock_timer:cancel()
+                state.clock_timer = nil
+            end
             prise.exit()
             return true
         else

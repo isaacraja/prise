@@ -793,6 +793,14 @@ pub const App = struct {
                     if (app.io_loop) |l| task.cancel(l) catch {};
                     app.render_timer = null;
                 }
+                if (app.pipe_read_task) |*task| {
+                    if (app.io_loop) |l| task.cancel(l) catch {};
+                    app.pipe_read_task = null;
+                }
+                if (app.send_task) |*task| {
+                    if (app.io_loop) |l| task.cancel(l) catch {};
+                    app.send_task = null;
+                }
                 // Wake up TTY thread so it can exit
                 app.vx.deviceStatusReport(app.tty.writer()) catch {};
             }
