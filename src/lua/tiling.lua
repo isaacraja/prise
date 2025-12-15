@@ -114,6 +114,8 @@ local POWERLINE_SYMBOLS = {
     right_thin = "",
     left_solid = "",
     left_thin = "",
+    left_round = "\u{E0B6}",
+    right_round = "\u{E0B4}",
 }
 
 ---@class PriseThemeOptions
@@ -264,8 +266,12 @@ local state = {
     },
     -- Tab bar hit regions: array of {start_x, end_x, tab_index}
     tab_regions = {},
+    -- Tab close button regions: array of {start_x, end_x, tab_index}
+    tab_close_regions = {},
     -- Currently hovered tab index (nil if none)
     hovered_tab = nil,
+    -- Currently hovered close button tab index (nil if none)
+    hovered_close_tab = nil,
     -- Screen dimensions
     screen_cols = 80,
     screen_rows = 24,
@@ -688,12 +694,13 @@ local function set_active_tab_index(new_index)
 end
 
 ---Close the current tab
-local function close_current_tab()
+---Close tab at given index
+---@param idx integer
+local function close_tab(idx)
     if #state.tabs == 0 then
         return
     end
 
-    local idx = state.active_tab
     local tab = state.tabs[idx]
     if not tab then
         return
@@ -745,6 +752,11 @@ local function close_current_tab()
 
     prise.request_frame()
     prise.save()
+end
+
+---Close the current tab
+local function close_current_tab()
+    close_tab(state.active_tab)
 end
 
 ---Remove a pane by id from the appropriate tab
@@ -1919,19 +1931,32 @@ function M.update(event)
     elseif event.type == "mouse" then
         local d = event.data
 
-        -- Track tab hover state on motion
+        -- Track tab and close button hover state on motion
         if d.action == "motion" and #state.tab_regions > 0 then
             local new_hover = nil
+            local new_close_hover = nil
             if d.y < 1 then
-                for _, region in ipairs(state.tab_regions) do
+                -- Check close button regions first (they're more specific)
+                for _, region in ipairs(state.tab_close_regions) do
                     if d.x >= region.start_x and d.x < region.end_x then
+                        new_close_hover = region.tab_index
                         new_hover = region.tab_index
                         break
                     end
                 end
+                -- If not on close button, check tab regions
+                if not new_close_hover then
+                    for _, region in ipairs(state.tab_regions) do
+                        if d.x >= region.start_x and d.x < region.end_x then
+                            new_hover = region.tab_index
+                            break
+                        end
+                    end
+                end
             end
-            if new_hover ~= state.hovered_tab then
+            if new_hover ~= state.hovered_tab or new_close_hover ~= state.hovered_close_tab then
                 state.hovered_tab = new_hover
+                state.hovered_close_tab = new_close_hover
                 prise.request_frame()
             end
         end
@@ -1965,6 +1990,14 @@ function M.update(event)
 
             -- Check if click is on tab bar (y < 1 and we have tab regions)
             if d.y < 1 and #state.tab_regions > 0 then
+                -- Check close button regions first
+                for _, region in ipairs(state.tab_close_regions) do
+                    if d.x >= region.start_x and d.x < region.end_x then
+                        close_tab(region.tab_index)
+                        return
+                    end
+                end
+                -- Then check tab regions for switching
                 for _, region in ipairs(state.tab_regions) do
                     if d.x >= region.start_x and d.x < region.end_x then
                         set_active_tab_index(region.tab_index)
@@ -2280,41 +2313,104 @@ end
 local function build_tab_bar()
     if not config.tab_bar.show_single_tab and #state.tabs <= 1 then
         state.tab_regions = {}
+        state.tab_close_regions = {}
         return nil
     end
+
+    local num_tabs = #state.tabs
+    local total_width = state.screen_cols
+    local endcap_width = 2 -- left_round and right_round are 1 cell each
+
+    -- Calculate tab widths: divide available space evenly
+    local base_tab_width = math.floor(total_width / num_tabs)
+    local extra_pixels = total_width % num_tabs
 
     local segments = {}
     local x_pos = 0
     state.tab_regions = {}
+    state.tab_close_regions = {}
 
     for i, tab in ipairs(state.tabs) do
         local is_active = (i == state.active_tab)
         local is_hovered = (i == state.hovered_tab)
-        local label = " " .. (tab.title or tostring(i)) .. " "
-        local label_width = #label
+        local is_close_hovered = (i == state.hovered_close_tab)
+
+        -- Distribute extra width to last tabs so they fill the line
+        local tab_width = base_tab_width
+        if i > (num_tabs - extra_pixels) then
+            tab_width = tab_width + 1
+        end
+
+        -- Close widget: always reserve 2 cells, only show icon when hovered
+        local close_widget_width = 2
+        local close_text = "  " -- 2 spaces when not hovered
+        if is_close_hovered then
+            close_text = "\u{F530}" -- md-close_circle (filled)
+        elseif is_hovered then
+            close_text = "\u{F467}" -- md-close_circle_outline
+        end
+        -- Pad close_text to exactly close_widget_width cells
+        local close_text_width = prise.gwidth(close_text)
+        if close_text_width < close_widget_width then
+            close_text = close_text .. string.rep(" ", close_widget_width - close_text_width)
+        end
+
+        -- Get label and calculate padding
+        local title = tab.title or tostring(i)
+        -- Always reserve space for endcaps and close widget
+        local inner_width = tab_width - endcap_width - close_widget_width
+        local title_width = prise.gwidth(title)
+
+        -- Truncate title if needed
+        if title_width > inner_width then
+            title = string.sub(title, 1, inner_width - 1) .. "…"
+            title_width = prise.gwidth(title)
+        end
+
+        -- Calculate padding to center the title, ensuring exact width
+        local padding_total = inner_width - title_width
+        local pad_left = math.floor(padding_total / 2)
+        local pad_right = inner_width - title_width - pad_left
+
+        local label = string.rep(" ", pad_left) .. title .. string.rep(" ", pad_right)
+
+        -- Record close button hit region (after left endcap)
+        local close_start = x_pos + 1 -- after left endcap
+        table.insert(state.tab_close_regions, {
+            start_x = close_start,
+            end_x = close_start + close_widget_width,
+            tab_index = i,
+        })
 
         -- Record hit region for this tab
         table.insert(state.tab_regions, {
             start_x = x_pos,
-            end_x = x_pos + label_width,
+            end_x = x_pos + tab_width,
             tab_index = i,
         })
-        x_pos = x_pos + label_width
+        x_pos = x_pos + tab_width
 
-        local style
+        local tab_bg, tab_fg
         if is_active then
-            style = { bg = THEME.accent, fg = THEME.fg_dark }
+            tab_bg = THEME.accent
+            tab_fg = THEME.fg_dark
         elseif is_hovered then
-            style = { bg = THEME.bg3, fg = THEME.fg_bright }
+            tab_bg = THEME.bg3
+            tab_fg = THEME.fg_bright
         else
-            style = { bg = THEME.bg2, fg = THEME.fg_dim }
+            tab_bg = THEME.bg2
+            tab_fg = THEME.fg_dim
         end
 
-        table.insert(segments, { text = label, style = style })
+        -- Left endcap
+        table.insert(segments, { text = POWERLINE_SYMBOLS.left_round, style = { fg = tab_bg, bg = THEME.bg1 } })
+        -- Close widget
+        table.insert(segments, { text = close_text, style = { bg = tab_bg, fg = tab_fg } })
+        -- Tab content
+        table.insert(segments, { text = label, style = { bg = tab_bg, fg = tab_fg } })
+        -- Right endcap
+        table.insert(segments, { text = POWERLINE_SYMBOLS.right_round, style = { fg = tab_bg, bg = THEME.bg1 } })
     end
-
-    -- Cap off with default background so last tab doesn't fill the row
-    table.insert(segments, { text = " ", style = { bg = THEME.bg1 } })
 
     return prise.Text(segments)
 end
