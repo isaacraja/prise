@@ -2551,6 +2551,58 @@ const Server = struct {
         return .{ .map = result_entries };
     }
 
+    /// List available sessions for OpenTUI client discovery.
+    /// Returns: { sessions: [ { id, name, attached_client_count }, ... ], pty_validity }
+    fn handleListSessions(self: *Server) !msgpack.Value {
+        const session_count = self.ptys.count();
+        const sessions_array = try self.allocator.alloc(msgpack.Value, session_count);
+        errdefer self.allocator.free(sessions_array);
+
+        var i: usize = 0;
+        var iter = self.ptys.iterator();
+        while (iter.next()) |entry| {
+            const pty_instance = entry.value_ptr.*;
+
+            // Use title as session name if non-empty, else fallback to "PTY <id>"
+            const session_name_str = if (pty_instance.title.items.len > 0)
+                pty_instance.title.items
+            else
+                try std.fmt.allocPrint(self.allocator, "PTY {}", .{pty_instance.id});
+
+            // If we allocated fallback name, free it after duping
+            const is_allocated = pty_instance.title.items.len == 0;
+            defer if (is_allocated) self.allocator.free(session_name_str);
+
+            const session_entries = try self.allocator.alloc(msgpack.Value.KeyValue, 3);
+            session_entries[0] = .{
+                .key = .{ .string = try self.allocator.dupe(u8, "id") },
+                .value = .{ .unsigned = @intCast(pty_instance.id) },
+            };
+            session_entries[1] = .{
+                .key = .{ .string = try self.allocator.dupe(u8, "name") },
+                .value = .{ .string = try self.allocator.dupe(u8, session_name_str) },
+            };
+            session_entries[2] = .{
+                .key = .{ .string = try self.allocator.dupe(u8, "attached_client_count") },
+                .value = .{ .unsigned = @intCast(pty_instance.clients.items.len) },
+            };
+
+            sessions_array[i] = .{ .map = session_entries };
+            i += 1;
+        }
+
+        const result_entries = try self.allocator.alloc(msgpack.Value.KeyValue, 2);
+        result_entries[0] = .{
+            .key = .{ .string = try self.allocator.dupe(u8, "pty_validity") },
+            .value = .{ .integer = self.start_time_ms },
+        };
+        result_entries[1] = .{
+            .key = .{ .string = try self.allocator.dupe(u8, "sessions") },
+            .value = .{ .array = sessions_array },
+        };
+        return .{ .map = result_entries };
+    }
+
     fn handleRequest(self: *Server, client: *Client, method: []const u8, params: msgpack.Value) !msgpack.Value {
         if (std.mem.eql(u8, method, "ping")) {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "pong") };
@@ -2558,6 +2610,8 @@ const Server = struct {
             return self.handleGetServerInfo();
         } else if (std.mem.eql(u8, method, "list_ptys")) {
             return self.handleListPtys();
+        } else if (std.mem.eql(u8, method, "list_sessions")) {
+            return self.handleListSessions();
         } else if (std.mem.eql(u8, method, "spawn_pty")) {
             return self.handleSpawnPty(client, params);
         } else if (std.mem.eql(u8, method, "close_pty")) {
@@ -3735,4 +3789,133 @@ test "server - pty exit notification" {
         }
     }
     try testing.expect(found_send);
+}
+
+test "list_sessions RPC handler" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var server: Server = .{
+        .allocator = allocator,
+        .loop = &loop,
+        .listen_fd = 100,
+        .socket_path = "/tmp/test.sock",
+        .clients = std.ArrayList(*Client).empty,
+        .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
+        .signal_pipe_fds = undefined,
+        .start_time_ms = 1000,
+    };
+    defer {
+        for (server.clients.items) |client| {
+            client.attached_ptys.deinit(allocator);
+            allocator.destroy(client);
+        }
+        server.clients.deinit(allocator);
+        var iter = server.ptys.iterator();
+        while (iter.next()) |entry| {
+            const pty_inst = entry.value_ptr.*;
+            pty_inst.title.deinit(allocator);
+            pty_inst.cwd.deinit(allocator);
+            pty_inst.clients.deinit(allocator);
+            pty_inst.terminal.deinit(allocator);
+            pty_inst.render_state.deinit(allocator);
+            posix.close(pty_inst.pipe_fds[0]);
+            posix.close(pty_inst.pipe_fds[1]);
+            posix.close(pty_inst.exit_pipe_fds[0]);
+            posix.close(pty_inst.exit_pipe_fds[1]);
+            allocator.destroy(pty_inst);
+        }
+        server.ptys.deinit();
+    }
+
+    // Create two PTYs with different titles
+    const pipe_fds1 = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    const exit_pipe_fds1 = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    const pty1 = try allocator.create(Pty);
+    pty1.* = .{
+        .id = 1,
+        .process = .{ .master = -1, .slave = -1, .pid = 0 },
+        .clients = std.ArrayList(*Client).empty,
+        .running = std.atomic.Value(bool).init(true),
+        .terminal = try ghostty_vt.Terminal.init(allocator, .{ .cols = 80, .rows = 24 }),
+        .allocator = allocator,
+        .title = std.ArrayList(u8).empty,
+        .title_dirty = false,
+        .cwd = std.ArrayList(u8).empty,
+        .cwd_dirty = false,
+        .pipe_fds = pipe_fds1,
+        .exit_pipe_fds = exit_pipe_fds1,
+        .render_state = .empty,
+        .server_ptr = &server,
+        .exited = std.atomic.Value(bool).init(false),
+        .exit_status = std.atomic.Value(u32).init(0),
+    };
+    try pty1.title.appendSlice(allocator, "my session");
+    try server.ptys.put(1, pty1);
+
+    // Second PTY with empty title (should fallback to "PTY 2")
+    const pipe_fds2 = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    const exit_pipe_fds2 = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    const pty2 = try allocator.create(Pty);
+    pty2.* = .{
+        .id = 2,
+        .process = .{ .master = -1, .slave = -1, .pid = 0 },
+        .clients = std.ArrayList(*Client).empty,
+        .running = std.atomic.Value(bool).init(true),
+        .terminal = try ghostty_vt.Terminal.init(allocator, .{ .cols = 80, .rows = 24 }),
+        .allocator = allocator,
+        .title = std.ArrayList(u8).empty,
+        .title_dirty = false,
+        .cwd = std.ArrayList(u8).empty,
+        .cwd_dirty = false,
+        .pipe_fds = pipe_fds2,
+        .exit_pipe_fds = exit_pipe_fds2,
+        .render_state = .empty,
+        .server_ptr = &server,
+        .exited = std.atomic.Value(bool).init(false),
+        .exit_status = std.atomic.Value(u32).init(0),
+    };
+    try server.ptys.put(2, pty2);
+
+    // Call handleListSessions
+    const result = try server.handleListSessions();
+    defer result.deinit(allocator);
+
+    // Verify structure
+    try testing.expect(result == .map);
+    try testing.expectEqual(@as(usize, 2), result.map.len);
+
+    // Check pty_validity
+    const validity_kv = result.map[0];
+    try testing.expectEqualStrings("pty_validity", validity_kv.key.string);
+    try testing.expectEqual(@as(i64, 1000), validity_kv.value.integer);
+
+    // Check sessions array
+    const sessions_kv = result.map[1];
+    try testing.expectEqualStrings("sessions", sessions_kv.key.string);
+    try testing.expect(sessions_kv.value == .array);
+    try testing.expectEqual(@as(usize, 2), sessions_kv.value.array.len);
+
+    // Verify session 1 (with title)
+    const session1 = sessions_kv.value.array[0];
+    try testing.expect(session1 == .map);
+    try testing.expectEqual(@as(usize, 3), session1.map.len);
+
+    const session1_id = session1.map[0];
+    try testing.expectEqualStrings("id", session1_id.key.string);
+    try testing.expectEqual(@as(u64, 1), session1_id.value.unsigned);
+
+    const session1_name = session1.map[1];
+    try testing.expectEqualStrings("name", session1_name.key.string);
+    try testing.expectEqualStrings("my session", session1_name.value.string);
+
+    // Verify session 2 (fallback name)
+    const session2 = sessions_kv.value.array[1];
+    try testing.expect(session2 == .map);
+    const session2_name = session2.map[1];
+    try testing.expectEqualStrings("name", session2_name.key.string);
+    try testing.expectEqualStrings("PTY 2", session2_name.value.string);
 }
