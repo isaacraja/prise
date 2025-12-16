@@ -2564,6 +2564,7 @@ pub const App = struct {
     }
 
     pub fn switchToSession(self: *App, target_session: []const u8) !void {
+        std.debug.assert(target_session.len > 0);
         // Don't switch if already on the target session
         if (self.current_session_name) |current| {
             if (std.mem.eql(u8, current, target_session)) {
@@ -2579,7 +2580,9 @@ pub const App = struct {
         }
 
         // Build arguments for exec
+        // Build arguments for exec
         const target_z = try self.allocator.dupeZ(u8, target_session);
+        errdefer self.allocator.free(target_z);
         const args = [_]?[*:0]const u8{
             "prise",
             "session",
