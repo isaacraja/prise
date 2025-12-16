@@ -13,6 +13,7 @@ local utils = require("utils")
 ---@field direction "row"|"col"
 ---@field ratio? number
 ---@field children (Pane|Split)[]
+---@field last_focused_child_idx? number Index of last focused child (1-based)
 
 ---@alias Node Pane|Split
 
@@ -555,6 +556,67 @@ local function get_last_leaf(node)
     return nil
 end
 
+---Get the preferred leaf node based on focus history
+---@param node? Node
+---@param forward boolean If true, prefer first leaf; if false, prefer last leaf when no history
+---@return Pane?
+local function get_preferred_leaf(node, forward)
+    if not node then
+        return nil
+    end
+
+    if node.type == "pane" then
+        ---@cast node Pane
+        return node
+    end
+
+    if is_split(node) then
+        if
+            node.last_focused_child_idx
+            and node.last_focused_child_idx >= 1
+            and node.last_focused_child_idx <= #node.children
+        then
+            local preferred_child = node.children[node.last_focused_child_idx]
+            return get_preferred_leaf(preferred_child, forward)
+        end
+
+        if forward then
+            return get_first_leaf(node)
+        end
+        return get_last_leaf(node)
+    end
+
+    return nil
+end
+
+---Update the focus history in the node tree
+---Records which child was last focused for each split in the path to the focused pane
+local function update_focus_history()
+    local root = get_active_root()
+    if not state.focused_id or not root then
+        return
+    end
+
+    local path = find_node_path(root, state.focused_id)
+    if not path then
+        return
+    end
+
+    for i = 1, #path - 1 do
+        local node = path[i]
+        local child = path[i + 1]
+
+        if is_split(node) then
+            for k, c in ipairs(node.children) do
+                if c == child then
+                    node.last_focused_child_idx = k
+                    break
+                end
+            end
+        end
+    end
+end
+
 ---Update the cached git branch for the focused pane
 local function update_cached_git_branch()
     local root = get_active_root()
@@ -768,6 +830,7 @@ local function set_active_tab_index(new_index)
     state.focused_id = new_focus_id
     update_pty_focus(old_focused, new_focus_id)
     update_cached_git_branch()
+    update_focus_history()
     prise.request_frame()
 end
 
@@ -829,6 +892,7 @@ local function close_tab(idx)
         state.focused_id = new_focus_id
         update_pty_focus(old_focused, new_focus_id)
         update_cached_git_branch()
+        update_focus_history()
     else
         -- No tabs left
         state.focused_id = nil
@@ -895,6 +959,7 @@ local function remove_pane_by_id(id)
                 state.focused_id = new_focus_id
                 update_pty_focus(old_focused, new_focus_id)
                 update_cached_git_branch()
+                update_focus_history()
             end
             prise.request_frame()
             return false
@@ -913,6 +978,7 @@ local function remove_pane_by_id(id)
             end
             update_pty_focus(old_id, state.focused_id)
             update_cached_git_branch()
+            update_focus_history()
         end
         prise.request_frame()
         return false
@@ -1176,6 +1242,9 @@ local function move_focus(direction)
         return
     end
 
+    -- Record focus history for nested splits
+    update_focus_history()
+
     -- "left"/"right" implies moving along "row"
     -- "up"/"down" implies moving along "col"
     local target_split_type = (direction == "left" or direction == "right") and "row" or "col"
@@ -1214,20 +1283,15 @@ local function move_focus(direction)
     end
 
     if sibling_node then
-        -- Found a sibling tree/pane. Find the closest leaf.
-        ---@type Pane?
-        local target_leaf
-        if forward then
-            target_leaf = get_first_leaf(sibling_node)
-        else
-            target_leaf = get_last_leaf(sibling_node)
-        end
+        -- Found a sibling tree/pane. Prefer previously focused leaf.
+        local target_leaf = get_preferred_leaf(sibling_node, forward)
 
         if target_leaf and target_leaf.id ~= state.focused_id then
             local old_id = state.focused_id
             state.focused_id = target_leaf.id
             update_pty_focus(old_id, state.focused_id)
             update_cached_git_branch()
+            update_focus_history()
             prise.request_frame()
         end
     end
@@ -1878,6 +1942,7 @@ function M.update(event)
             state.pending_split = nil
         end
         update_pty_focus(old_focused_id, state.focused_id)
+        update_focus_history()
         prise.request_frame()
         prise.save() -- Auto-save on pane added
     elseif event.type == "key_press" then
@@ -2208,6 +2273,8 @@ function M.update(event)
                 local old_id = state.focused_id
                 state.focused_id = d.target
                 update_pty_focus(old_id, state.focused_id)
+                update_cached_git_branch()
+                update_focus_history()
                 prise.request_frame()
             end
         end
@@ -3035,6 +3102,8 @@ function M.set_state(saved, pty_lookup)
         end
     end
 
+    update_cached_git_branch()
+    update_focus_history()
     prise.request_frame()
 end
 
