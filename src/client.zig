@@ -8,7 +8,8 @@ const msgpack = @import("msgpack.zig");
 const redraw = @import("redraw.zig");
 const rpc = @import("rpc.zig");
 const Surface = @import("Surface.zig");
-const UI = @import("ui.zig").UI;
+const ui_mod = @import("ui.zig");
+const UI = ui_mod.UI;
 const vaxis_helper = @import("vaxis_helper.zig");
 const widget = @import("widget.zig");
 const posix = std.posix;
@@ -221,6 +222,7 @@ pub const ServerAction = union(enum) {
     pub const ColorQueryTarget = struct {
         pty_id: u32,
         target: Target,
+        slot: usize, // Response slot for ordered delivery
 
         pub const Target = union(enum) {
             palette: u8,
@@ -301,7 +303,13 @@ pub const ClientLogic = struct {
 
     fn handleCopySelectionResult(result: msgpack.Value) ServerAction {
         if (result == .string) {
+            log.info("handleCopySelectionResult: received selection text ({} bytes)", .{result.string.len});
             return .{ .copy_to_clipboard = result.string };
+        }
+        if (result == .nil) {
+            log.warn("handleCopySelectionResult: no selection (nil result)", .{});
+        } else {
+            log.warn("handleCopySelectionResult: unexpected result type: {s}", .{@tagName(result)});
         }
         return .none;
     }
@@ -399,6 +407,7 @@ pub const ClientLogic = struct {
         var pty_id: ?u32 = null;
         var index: ?u8 = null;
         var kind: ?[]const u8 = null;
+        var slot: ?usize = null;
 
         for (params.map) |kv| {
             if (kv.key != .string) continue;
@@ -416,13 +425,20 @@ pub const ClientLogic = struct {
                 };
             } else if (std.mem.eql(u8, kv.key.string, "kind")) {
                 kind = if (kv.value == .string) kv.value.string else null;
+            } else if (std.mem.eql(u8, kv.key.string, "slot")) {
+                slot = switch (kv.value) {
+                    .integer => |i| @intCast(i),
+                    .unsigned => |u| @intCast(u),
+                    else => null,
+                };
             }
         }
 
         const pid = pty_id orelse return .none;
+        const response_slot = slot orelse return .none;
 
         if (index) |idx| {
-            return .{ .color_query = .{ .pty_id = pid, .target = .{ .palette = idx } } };
+            return .{ .color_query = .{ .pty_id = pid, .target = .{ .palette = idx }, .slot = response_slot } };
         } else if (kind) |k| {
             const target: ServerAction.ColorQueryTarget.Target = if (std.mem.eql(u8, k, "foreground"))
                 .foreground
@@ -432,7 +448,7 @@ pub const ClientLogic = struct {
                 .cursor
             else
                 return .none;
-            return .{ .color_query = .{ .pty_id = pid, .target = target } };
+            return .{ .color_query = .{ .pty_id = pid, .target = target, .slot = response_slot } };
         }
 
         return .none;
@@ -647,16 +663,29 @@ pub const App = struct {
     pub const PendingColorQuery = struct {
         pty_id: u32,
         target: ServerAction.ColorQueryTarget.Target,
+        slot: usize,
     };
 
-    pub fn init(allocator: std.mem.Allocator) !App {
+    pub const InitError = struct {
+        err: anyerror,
+        lua_msg: ?[:0]const u8,
+    };
+
+    pub const InitResult = union(enum) {
+        ok: App,
+        err: InitError,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) InitResult {
         var app: App = .{
             .allocator = allocator,
-            .vx = try vaxis.init(allocator, .{
+            .vx = vaxis.init(allocator, .{
                 .kitty_keyboard_flags = .{
                     .report_events = true,
                 },
-            }),
+            }) catch |err| {
+                return .{ .err = .{ .err = err, .lua_msg = null } };
+            },
             .tty = undefined,
             .tty_buffer = undefined,
             .msg_buffer = .empty,
@@ -667,27 +696,37 @@ pub const App = struct {
             .pending_attach_cwd = std.AutoHashMap(u32, []const u8).init(allocator),
             .pending_color_queries = .empty,
         };
-        app.tty = try vaxis.Tty.init(&app.tty_buffer);
-        // parser doesn't need init? assuming default init is fine or init(&allocator)
         app.parser = .{};
 
         log.info("Vaxis initialized", .{});
 
         // Initialize Lua UI
-        app.ui = UI.init(allocator) catch |err| {
-            app.vx.deinit(allocator, app.tty.writer());
-            app.tty.deinit();
-            return err;
-        };
+        switch (UI.init(allocator)) {
+            .ok => |ui| app.ui = ui,
+            .err => |init_err| {
+                // Note: we skip vx.deinit here since TTY isn't initialized yet
+                // and vx.deinit requires a writer. Resources will be cleaned up on exit.
+                return .{ .err = .{ .err = init_err.err, .lua_msg = init_err.lua_msg } };
+            },
+        }
         log.info("Lua UI initialized", .{});
 
         // Create pipe for TTY thread -> Main thread communication
-        const fds = try posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+        const fds = posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true }) catch |err| {
+            return .{ .err = .{ .err = err, .lua_msg = null } };
+        };
         app.pipe_read_fd = fds[0];
         app.pipe_write_fd = fds[1];
         log.info("Pipe created: read_fd={} write_fd={}", .{ app.pipe_read_fd, app.pipe_write_fd });
 
-        return app;
+        return .{ .ok = app };
+    }
+
+    /// Initialize the TTY. Must be called after App is in its final memory location,
+    /// since the tty writer holds a pointer to tty_buffer.
+    pub fn initTty(self: *App) !void {
+        self.tty = try vaxis.Tty.init(&self.tty_buffer);
+        log.info("TTY initialized", .{});
     }
 
     pub fn deinit(self: *App) void {
@@ -914,6 +953,14 @@ pub const App = struct {
                 try app_ptr.renameCurrentSession(new_name);
             }
         }.renameCb);
+
+        // Register switch_session callback
+        self.ui.setSwitchSessionCallback(self, struct {
+            fn switchCb(ctx: *anyopaque, target_session: []const u8) anyerror!void {
+                const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                try app_ptr.switchToSession(target_session);
+            }
+        }.switchCb);
 
         // Manually trigger initial resize to connect
         const ws = try vaxis.Tty.getWinsize(self.tty.fd);
@@ -1345,7 +1392,7 @@ pub const App = struct {
     }
 
     fn handleColorQuery(self: *App, query: ServerAction.ColorQueryTarget) !void {
-        log.debug("handleColorQuery: pty={} target={any}", .{ query.pty_id, query.target });
+        log.debug("handleColorQuery: pty={} slot={} target={any}", .{ query.pty_id, query.slot, query.target });
 
         // Check if we have the color cached
         const cached_color: ?vaxis.Cell.Color = switch (query.target) {
@@ -1357,10 +1404,14 @@ pub const App = struct {
 
         if (cached_color) |color| {
             // Send response immediately
-            try self.sendColorResponse(query.pty_id, query.target, color);
+            try self.sendColorResponse(query.pty_id, query.slot, query.target, color);
         } else {
             // Queue for later when we get the color_report
-            try self.pending_color_queries.append(self.allocator, .{ .pty_id = query.pty_id, .target = query.target });
+            try self.pending_color_queries.append(self.allocator, .{
+                .pty_id = query.pty_id,
+                .target = query.target,
+                .slot = query.slot,
+            });
 
             // Query the terminal for this color
             switch (query.target) {
@@ -1394,7 +1445,7 @@ pub const App = struct {
                 };
 
                 if (color) |c| {
-                    self.sendColorResponse(pending.pty_id, pending.target, c) catch |err| {
+                    self.sendColorResponse(pending.pty_id, pending.slot, pending.target, c) catch |err| {
                         log.err("Failed to send color response: {}", .{err});
                     };
                 }
@@ -1406,33 +1457,34 @@ pub const App = struct {
         }
     }
 
-    fn sendColorResponse(self: *App, pty_id: u32, target: ServerAction.ColorQueryTarget.Target, color: vaxis.Cell.Color) !void {
+    fn sendColorResponse(self: *App, pty_id: u32, slot: usize, target: ServerAction.ColorQueryTarget.Target, color: vaxis.Cell.Color) !void {
         const rgb = color.rgb;
-        log.debug("sendColorResponse: pty={} target={any} color=#{x:0>2}{x:0>2}{x:0>2}", .{ pty_id, target, rgb[0], rgb[1], rgb[2] });
+        log.debug("sendColorResponse: pty={} slot={} target={any} color=#{x:0>2}{x:0>2}{x:0>2}", .{ pty_id, slot, target, rgb[0], rgb[1], rgb[2] });
 
         // Build the color_response notification
-        // Format: [2, "color_response", {pty_id: N, r: R, g: G, b: B, index: M}] or
-        //         [2, "color_response", {pty_id: N, r: R, g: G, b: B, kind: "foreground"}]
-        var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 5);
+        // Format: [2, "color_response", {pty_id: N, slot: S, r: R, g: G, b: B, index: M}] or
+        //         [2, "color_response", {pty_id: N, slot: S, r: R, g: G, b: B, kind: "foreground"}]
+        var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 6);
         defer self.allocator.free(map_items);
 
         map_items[0] = .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = pty_id } };
-        map_items[1] = .{ .key = .{ .string = "r" }, .value = .{ .unsigned = rgb[0] } };
-        map_items[2] = .{ .key = .{ .string = "g" }, .value = .{ .unsigned = rgb[1] } };
-        map_items[3] = .{ .key = .{ .string = "b" }, .value = .{ .unsigned = rgb[2] } };
+        map_items[1] = .{ .key = .{ .string = "slot" }, .value = .{ .unsigned = slot } };
+        map_items[2] = .{ .key = .{ .string = "r" }, .value = .{ .unsigned = rgb[0] } };
+        map_items[3] = .{ .key = .{ .string = "g" }, .value = .{ .unsigned = rgb[1] } };
+        map_items[4] = .{ .key = .{ .string = "b" }, .value = .{ .unsigned = rgb[2] } };
 
         switch (target) {
             .palette => |idx| {
-                map_items[4] = .{ .key = .{ .string = "index" }, .value = .{ .unsigned = idx } };
+                map_items[5] = .{ .key = .{ .string = "index" }, .value = .{ .unsigned = idx } };
             },
             .foreground => {
-                map_items[4] = .{ .key = .{ .string = "kind" }, .value = .{ .string = "foreground" } };
+                map_items[5] = .{ .key = .{ .string = "kind" }, .value = .{ .string = "foreground" } };
             },
             .background => {
-                map_items[4] = .{ .key = .{ .string = "kind" }, .value = .{ .string = "background" } };
+                map_items[5] = .{ .key = .{ .string = "kind" }, .value = .{ .string = "background" } };
             },
             .cursor => {
-                map_items[4] = .{ .key = .{ .string = "kind" }, .value = .{ .string = "cursor" } };
+                map_items[5] = .{ .key = .{ .string = "kind" }, .value = .{ .string = "cursor" } };
             },
         }
 
@@ -2373,9 +2425,62 @@ pub const App = struct {
     }
 
     fn copyToClipboard(self: *App, text: []const u8) void {
+        if (text.len == 0) {
+            log.warn("copyToClipboard: empty text, nothing to copy", .{});
+            return;
+        }
+
+        log.info("copyToClipboard: copying {} bytes to clipboard", .{text.len});
+
+        // Try native clipboard utilities first (more reliable than OSC 52)
+        self.copyToClipboardNative(text) catch |err| {
+            log.warn("Native clipboard copy failed: {}, trying OSC 52", .{err});
+            self.copyToClipboardOSC52(text);
+        };
+    }
+
+    fn copyToClipboardNative(self: *App, text: []const u8) !void {
+        const builtin = @import("builtin");
+        const clipboard_cmd = switch (builtin.os.tag) {
+            .macos => "pbcopy",
+            .linux => blk: {
+                // Try to detect which clipboard utility is available
+                // Prefer wl-copy (Wayland) or xclip (X11)
+                const wayland = std.process.hasEnvVar(self.allocator, "WAYLAND_DISPLAY") catch false;
+                break :blk if (wayland) "wl-copy" else "xclip";
+            },
+            else => return error.UnsupportedPlatform,
+        };
+
+        const args = if (std.mem.eql(u8, clipboard_cmd, "xclip"))
+            &[_][]const u8{ clipboard_cmd, "-selection", "clipboard" }
+        else
+            &[_][]const u8{clipboard_cmd};
+
+        var child = std.process.Child.init(args, self.allocator);
+        child.stdin_behavior = .Pipe;
+
+        try child.spawn();
+
+        try child.stdin.?.writeAll(text);
+        child.stdin.?.close();
+        child.stdin = null;
+
+        const result = try child.wait();
+        if (result != .Exited or result.Exited != 0) {
+            return error.ClipboardCopyFailed;
+        }
+
+        log.info("Successfully copied to clipboard using {s}", .{clipboard_cmd});
+    }
+
+    fn copyToClipboardOSC52(self: *App, text: []const u8) void {
         const encoder = std.base64.standard.Encoder;
         const encoded_len = encoder.calcSize(text.len);
-        const encoded = self.allocator.alloc(u8, encoded_len) catch return;
+        const encoded = self.allocator.alloc(u8, encoded_len) catch |err| {
+            log.err("Failed to allocate memory for OSC 52 encoding: {}", .{err});
+            return;
+        };
         defer self.allocator.free(encoded);
         _ = encoder.encode(encoded, text);
 
@@ -2456,6 +2561,50 @@ pub const App = struct {
         };
 
         return error.SessionAlreadyExists;
+    }
+
+    pub fn switchToSession(self: *App, target_session: []const u8) !void {
+        std.debug.assert(target_session.len > 0);
+        // Don't switch if already on the target session
+        if (self.current_session_name) |current| {
+            if (std.mem.eql(u8, current, target_session)) {
+                log.info("Already on session '{s}', not switching", .{target_session});
+                return;
+            }
+        }
+
+        // Save current session first
+        if (self.current_session_name) |name| {
+            log.info("Saving current session '{s}' before switch", .{name});
+            try self.saveSession(name);
+        }
+
+        // Build arguments for exec
+        // Build arguments for exec
+        const target_z = try self.allocator.dupeZ(u8, target_session);
+        errdefer self.allocator.free(target_z);
+        const args = [_]?[*:0]const u8{
+            "prise",
+            "session",
+            "attach",
+            target_z,
+            null,
+        };
+
+        log.info("Exec'ing prise session attach '{s}'", .{target_session});
+
+        // Restore terminal state right before exec to minimize window of failure
+        const writer = self.tty.writer();
+        self.vx.deinit(self.allocator, writer);
+
+        // Use execvpeZ with current environment
+        const err = posix.execvpeZ("prise", @ptrCast(&args), @ptrCast(std.c.environ));
+
+        // If we get here, exec failed - reinitialize terminal
+        log.err("Failed to exec prise: {}", .{err});
+        self.vx = vaxis.Vaxis.init(self.allocator, .{}) catch return err;
+        self.vx.enterAltScreen(writer) catch {};
+        return err;
     }
 
     pub fn deleteCurrentSession(self: *App) void {

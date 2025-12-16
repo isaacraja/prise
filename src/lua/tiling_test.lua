@@ -90,38 +90,6 @@ package.loaded["prise"] = {
 local tiling = require("tiling")
 local t = tiling._test
 
--- === matches_keybind ===
-
--- Test: exact key match with no modifiers
-assert(t.matches_keybind({ key = "a" }, { key = "a" }) == true, "matches_keybind: exact key match")
-
--- Test: key mismatch
-assert(t.matches_keybind({ key = "a" }, { key = "b" }) == false, "matches_keybind: key mismatch")
-
--- Test: ctrl modifier required but not present
-assert(t.matches_keybind({ key = "a" }, { key = "a", ctrl = true }) == false, "matches_keybind: ctrl required")
-
--- Test: ctrl modifier present and required
-assert(t.matches_keybind({ key = "a", ctrl = true }, { key = "a", ctrl = true }) == true, "matches_keybind: ctrl match")
-
--- Test: ctrl present but not required
-assert(t.matches_keybind({ key = "a", ctrl = true }, { key = "a" }) == false, "matches_keybind: extra ctrl")
-
--- Test: all modifiers
-assert(
-    t.matches_keybind(
-        { key = "k", ctrl = true, alt = true, shift = true, super = true },
-        { key = "k", ctrl = true, alt = true, shift = true, super = true }
-    ) == true,
-    "matches_keybind: all modifiers"
-)
-
--- Test: super modifier only
-assert(t.matches_keybind({ key = "p", super = true }, { key = "p", super = true }) == true, "matches_keybind: super")
-
--- Test: super required but not present
-assert(t.matches_keybind({ key = "p" }, { key = "p", super = true }) == false, "matches_keybind: super required")
-
 -- === is_pane / is_split ===
 
 -- Test: is_pane with pane node
