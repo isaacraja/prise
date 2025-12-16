@@ -373,19 +373,38 @@ fn runClient(allocator: std.mem.Allocator, socket_path: []const u8, args: ParseR
     var loop = try io.Loop.init(allocator);
     defer loop.deinit();
 
-    var app = client.App.init(allocator) catch |err| {
-        var buf: [512]u8 = undefined;
-        var stderr = std.fs.File.stderr().writer(&buf);
-        defer stderr.interface.flush() catch {};
-        switch (err) {
-            error.InitLuaMustReturnTable => stderr.interface.print("error: init.lua must return a UI table\n  example: return require('prise').tiling()\n", .{}) catch {},
-            error.InitLuaFailed => stderr.interface.print("error: failed to load init.lua (check logs for details)\n", .{}) catch {},
-            error.DefaultUIFailed => stderr.interface.print("error: failed to load default UI\n", .{}) catch {},
-            else => {},
-        }
-        return err;
+    var app = switch (client.App.init(allocator)) {
+        .ok => |a| a,
+        .err => |init_err| {
+            var buf: [512]u8 = undefined;
+            var stderr = std.fs.File.stderr().writer(&buf);
+            defer stderr.interface.flush() catch {};
+            switch (init_err.err) {
+                error.InitLuaMustReturnTable => stderr.interface.print("error: init.lua must return a UI table\n  example: return require('prise').tiling()\n  see: man 5 prise\n", .{}) catch {},
+                error.InitLuaFailed => {
+                    if (init_err.lua_msg) |lua_msg| {
+                        stderr.interface.print("error: {s}\n  see: man 5 prise\n", .{lua_msg}) catch {};
+                    } else {
+                        stderr.interface.print("error: failed to load init.lua\n  see: man 5 prise\n", .{}) catch {};
+                    }
+                },
+                error.DefaultUIFailed => {
+                    if (init_err.lua_msg) |lua_msg| {
+                        stderr.interface.print("error: failed to load default UI: {s}\n", .{lua_msg}) catch {};
+                    } else {
+                        stderr.interface.print("error: failed to load default UI\n", .{}) catch {};
+                    }
+                },
+                else => {},
+            }
+            return init_err.err;
+        },
     };
     defer app.deinit();
+
+    // Initialize TTY after App is in its final memory location
+    // (tty writer holds pointer to tty_buffer)
+    try app.initTty();
 
     app.socket_path = socket_path;
     app.attach_session = args.attach_session;
@@ -756,6 +775,11 @@ test {
     _ = @import("mouse_encode.zig");
     _ = @import("vaxis_helper.zig");
     _ = @import("lua_test.zig");
+    _ = @import("key_string.zig");
+    _ = @import("action.zig");
+    _ = @import("keybind.zig");
+    _ = @import("keybind_compiler.zig");
+    _ = @import("keybind_matcher.zig");
 
     if (builtin.os.tag.isDarwin() or builtin.os.tag.isBSD()) {
         _ = @import("io/kqueue.zig");

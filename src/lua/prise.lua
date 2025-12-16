@@ -115,12 +115,14 @@ function M.Text(opts)
         return {
             type = "text",
             content = { opts },
+            style = opts.style,
         }
     end
 
     return {
         type = "text",
         content = opts.content or {},
+        style = opts.style,
         show_cursor = opts.show_cursor,
     }
 end
@@ -245,6 +247,23 @@ function M.Box(opts)
         max_height = opts.max_height,
         ratio = opts.ratio, -- Propagate ratio for layout system
         id = opts.id, -- Propagate id for widget identification
+    }
+end
+
+---@class SeparatorOpts
+---@field axis "horizontal"|"vertical" Separator orientation
+---@field style? table Style options (fg, bg, etc.)
+---@field border? "none"|"single"|"double"|"rounded" Line style (default: "single")
+
+---Create a separator widget for tmux-style pane borders
+---@param opts SeparatorOpts
+---@return table Separator widget
+function M.Separator(opts)
+    return {
+        type = "separator",
+        axis = opts.axis or "vertical",
+        style = opts.style,
+        border = opts.border or "single",
     }
 end
 
