@@ -1,0 +1,19 @@
+{
+  "name": "prise-opentui-client",
+  "version": "0.0.1",
+  "description": "OpenTUI client for prise terminal multiplexer",
+  "type": "module",
+  "main": "./dist/main.js",
+  "scripts": {
+    "dev": "bun run --watch src/main.ts",
+    "start": "bun run src/main.ts",
+    "build": "bun build src/main.ts --target=node --outdir dist",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "msgpackr": "^1.10.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
