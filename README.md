@@ -293,6 +293,20 @@ Add to `.vscode/settings.json`:
 }
 ```
 
+## Alternative Clients
+
+### OpenTUI Client
+
+Prise includes an **optional TypeScript/Node.js client** (`clients/opentui/`) that provides an alternative UI for the prise server. This allows you to run the multiplexer backend separately from the UI, enabling flexible terminal workflows.
+
+To use the OpenTUI client:
+
+1. Build and run the prise server (same as above)
+2. Build the OpenTUI client (see `clients/opentui/README.md`)
+3. Run the client to connect to the server
+
+See `clients/opentui/README.md` for detailed instructions on building, running, and the msgpack-RPC protocol.
+
 ## Requirements
 
 The following binaries are required for development:

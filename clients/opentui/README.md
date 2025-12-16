@@ -22,8 +22,7 @@ The OpenTUI client is an alternative UI for Prise that communicates with the Pri
 ## Prerequisites
 
 - **Prise server** running (see main README for installation)
-- **Node.js** 18+ or **Bun** 0.x
-- **npm** or **bun** for package management
+- **Bun** (required)
 
 ## Quick Start
 
@@ -50,13 +49,18 @@ The server creates a Unix domain socket at:
 ```
 where `<uid>` is your user ID.
 
-### 3. Build and run the OpenTUI client
+### 3. Run the OpenTUI client
 
 ```bash
 cd clients/opentui
-npm install  # or: bun install
-npm run build
-npm start    # or bun run src/main.ts
+bun install
+bun run start  # or: bun run src/index.tsx
+```
+
+Optional: bundle to `clients/opentui/dist/`:
+
+```bash
+bun run build
 ```
 
 ## Usage
@@ -66,43 +70,38 @@ npm start    # or bun run src/main.ts
 Run the client without arguments to see an interactive picker:
 
 ```bash
-bun run src/main.ts
+bun run start
 ```
 
 **Picker Commands:**
-- `k` / `↑` / `w` - Move selection up
-- `j` / `↓` / `s` - Move selection down
-- `g` / `Home` - Jump to first session
-- `G` / `End` - Jump to last session
-- `/text` - Filter sessions by name
-- `/` - Clear filter
-- `Enter` / blank line - Select and attach to session
-- `q` / `exit` / `Ctrl+C` - Cancel
+- `↑` / `k` - Move selection up
+- `↓` / `j` - Move selection down
+- `Home` / `g` - Jump to first session
+- `End` / `G` - Jump to last session
+- Type text - Filter sessions by name
+- `Backspace` - Delete filter character
+- `Enter` - Attach to selected session
+- `Ctrl+C` - Quit
 
-### List Sessions (Non-interactive)
+### List/Attach (Non-interactive)
 
-```bash
-bun run src/main.ts list
-```
+Not implemented yet; use the interactive picker for now.
 
-### Attach by Session ID
+### Terminal Mode
 
-```bash
-bun run src/main.ts attach <session_id>
-```
+Once attached, the client enters terminal mode.
 
-### Attach by Session Name
-
-```bash
-bun run src/main.ts --attach "my-session-name"
-```
+**Keybindings (tmux-inspired):**
+- `Ctrl+b` then `"` - Split vertically (top/bottom)
+- `Ctrl+b` then `%` - Split horizontally (left/right)
+- `Ctrl+b` then `h/j/k/l` - Move focus between panes
+- `Ctrl+b` then `c` - New tab
+- `Ctrl+b` then `n` / `p` - Next/previous tab
+- `Ctrl+b` then `x` - Close focused pane
 
 ### Detach
 
-While attached to a session, press `Ctrl+C` to detach. The client will:
-1. Send `detach_pty` request to server
-2. Restore terminal state
-3. Exit cleanly
+Press `Ctrl+C` to detach and return to the session picker.
 
 ## Environment Variables
 
@@ -111,12 +110,11 @@ The client uses the following environment variables to locate the server socket:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `PRISE_SOCKET` | `/tmp/prise-<uid>.sock` | Path to the Unix domain socket |
-| `PRISE_DEBUG` | `false` | Enable debug logging (set to `1` or `true`) |
 
 ### Example with custom socket path
 
 ```bash
-PRISE_SOCKET=/var/run/prise.sock npm start
+PRISE_SOCKET=/var/run/prise.sock bun run start
 ```
 
 ## RPC Protocol
@@ -419,7 +417,7 @@ npm run test
 
 Enable debug logging:
 ```bash
-PRISE_DEBUG=1 npm start
+PRISE_DEBUG=1 bun run start
 ```
 
 Or modify `src/rpc.ts` to add more `console.log` calls.

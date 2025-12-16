@@ -3,15 +3,18 @@
   "version": "0.0.1",
   "description": "OpenTUI client for prise terminal multiplexer",
   "type": "module",
-  "main": "./dist/main.js",
+  "main": "./dist/index.js",
   "scripts": {
-    "dev": "bun run --watch src/main.ts",
-    "start": "bun run src/main.ts",
-    "build": "bun build src/main.ts --target=node --outdir dist",
+    "dev": "bun run --watch src/index.tsx",
+    "start": "bun run src/index.tsx",
+    "build": "bun run scripts/bundle.ts",
     "test": "bun test"
   },
   "dependencies": {
-    "msgpackr": "^1.10.0"
+    "@opentui/core": "^0.1.60",
+    "@opentui/solid": "^0.1.60",
+    "msgpackr": "^1.10.0",
+    "solid-js": "^1.9.9"
   },
   "devDependencies": {
     "@types/bun": "latest"

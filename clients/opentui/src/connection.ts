@@ -7,7 +7,7 @@ import { createConnection } from "net";
 
 const log = (level: string, msg: string, ...args: unknown[]) => {
   const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] [${level}] ${msg}`, ...args);
+  console.error(`[${timestamp}] [${level}] ${msg}`, ...args);
 };
 
 /**

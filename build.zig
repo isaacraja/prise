@@ -278,6 +278,30 @@ pub fn build(b: *std.Build) void {
         enable_service_step.dependOn(&enable_linux.step);
     }
     enable_service_step.dependOn(b.getInstallStep());
+
+    // OpenTUI client bundle target (documentation/dev helper)
+    const opentui_step = b.step("opentui", "Bundle OpenTUI client (requires bun)");
+    const build_opentui = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        \\set -e
+        \\if [ ! -d clients/opentui ]; then
+        \\  echo "error: clients/opentui directory not found"
+        \\  exit 1
+        \\fi
+        \\if ! command -v bun &> /dev/null; then
+        \\  echo "error: bun not installed"
+        \\  echo "install from: https://bun.sh"
+        \\  exit 1
+        \\fi
+        \\cd clients/opentui
+        \\echo "Bundling OpenTUI client with bun..."
+        \\bun install
+        \\bun run build
+        \\echo "✓ OpenTUI client bundled successfully"
+        \\echo "To run: bun run start (from clients/opentui)"
+    });
+    opentui_step.dependOn(&build_opentui.step);
 }
 
 fn getVersion(b: *std.Build) []const u8 {

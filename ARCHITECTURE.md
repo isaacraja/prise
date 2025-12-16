@@ -83,6 +83,87 @@
 
 2. **Surfaces**:
 
-   - A **Surface** represents the state of a single remote PTY.
-   - Each Surface owns its own pair of Front/Back buffers.
-   - The Client manages a collection of Surfaces (one per connected PTY).
+    - A **Surface** represents the state of a single remote PTY.
+    - Each Surface owns its own pair of Front/Back buffers.
+    - The Client manages a collection of Surfaces (one per connected PTY).
+
+# RPC Protocol (msgpack-RPC)
+
+Prise uses **msgpack-RPC** over a Unix domain socket for client/server communication. This is what allows alternative UIs (like the OpenTUI client) to exist.
+
+## Message Format
+
+All messages are encoded using msgpack:
+
+- Request: `[0, msgid, method, params]`
+- Response: `[1, msgid, error, result]`
+- Notification: `[2, method, params]`
+
+## Socket Location
+
+Default:
+
+- `/tmp/prise-{uid}.sock`
+
+Override:
+
+- `PRISE_SOCKET=/path/to.sock`
+
+## Core RPC Methods (Requests)
+
+Implemented by the server in `src/server.zig`:
+
+- `ping()` → `"pong"`
+- `get_server_info()` → `{ version, pty_validity }`
+- `list_ptys()` → `{ pty_validity, ptys: [...] }`
+- `list_sessions()` → `{ pty_validity, sessions: [...] }`
+- `spawn_pty({ rows, cols, attach, cwd?, env?, macos_option_as_alt })` → `pty_id`
+- `close_pty(pty_id)`
+- `attach_pty([pty_id, macos_option_as_alt?])`
+- `resize_pty([pty_id, rows, cols])`
+- `detach_pty(pty_id)`
+- `detach_ptys([pty_id, ...])`
+- `get_selection(pty_id)` → string | nil
+- `clear_selection(pty_id)`
+
+Note: for input, clients typically use notifications (below) rather than requests.
+
+## Notifications
+
+### Server → Client
+
+- `redraw([events])` (see `src/redraw.zig` for the event list)
+- `pty_exited([pty_id, exit_code])`
+- `cwd_changed([pty_id, cwd])`
+- `color_query({ ... })` (terminal capability probing)
+
+### Client → Server
+
+The server also accepts notifications for high-frequency input/resize:
+
+- `write_pty([pty_id, data])` where `data` is msgpack bin
+- `resize_pty([pty_id, rows, cols])`
+- `key_input([pty_id, key_event])`
+- `mouse_input([pty_id, mouse_event])`
+- `paste_input([pty_id, data])`
+- `focus_event([pty_id, focused])`
+- `color_response({ ... })`
+
+## Client Types
+
+### Built-in Client (Lua)
+
+- `src/client.zig` (Vaxis)
+- Full UI (panes, tabs, command palette)
+- Config: `~/.config/prise/init.lua`
+
+### OpenTUI Client (TypeScript)
+
+- `clients/opentui/`
+- OpenTUI + Solid
+- Minimal UI, evolving toward tmux-like panes/tabs
+
+## Implementation Notes
+
+- Server I/O uses `io.Loop` (io_uring on Linux, kqueue on macOS)
+- PTY threads signal the main loop via pipes

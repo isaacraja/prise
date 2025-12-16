@@ -42,8 +42,8 @@ export class RpcCodec {
   unpackr: Unpackr;
 
   constructor() {
-    this.packr = new Packr({ useRecords: false });
-    this.unpackr = new Unpackr({ useRecords: false });
+    this.packr = new Packr({ useRecords: false, mapsAsObjects: true });
+    this.unpackr = new Unpackr({ useRecords: false, mapsAsObjects: true });
   }
 
   /**
@@ -191,31 +191,28 @@ export class RpcClient {
       this.buffer = Buffer.concat([this.buffer, Buffer.from(chunk)]);
     }
 
-    // Decode all complete messages from buffer
+    // Decode all complete messages from buffer, preserving any remainder bytes.
     const messages: unknown[] = [];
-    const unpackr = this.codec.unpackr;
+    let lastEnd = 0;
 
     try {
-      // Try to decode all messages in the buffer
-      unpackr.unpackMultiple(this.buffer, (msg: unknown) => {
+      this.codec.unpackr.unpackMultiple(this.buffer, (msg: unknown, _start?: number, end?: number) => {
         messages.push(msg);
+        if (typeof end === "number") {
+          lastEnd = end;
+        }
       });
-    } catch (err) {
-      // Not all data is decodable yet, which is fine
-      // We've decoded what we can
+    } catch {
+      // Partial message at end (or corrupt data). We still process decoded messages
+      // and keep any remaining bytes in the buffer for the next recv.
     }
 
-    // Process decoded messages
+    if (lastEnd > 0) {
+      this.buffer = this.buffer.subarray(lastEnd);
+    }
+
     for (const msg of messages) {
       this.handleMessage(msg);
-    }
-
-    // Clear buffer if all was decoded, otherwise keep unconsumed bytes
-    // Since unpackMultiple modifies offset internally, we can't easily track it
-    // Reset buffer to be safe - this is a limitation of the approach
-    // In production, would use a more sophisticated streaming decoder
-    if (messages.length > 0) {
-      this.buffer = Buffer.alloc(0);
     }
   }
 

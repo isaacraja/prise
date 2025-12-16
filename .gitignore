@@ -1,4 +1,9 @@
 zig-out/
 .zig-cache/
 .beads/
+.opencode/
 log
+
+# TypeScript client artifacts
+clients/opentui/node_modules/
+clients/opentui/dist/
