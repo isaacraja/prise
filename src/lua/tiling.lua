@@ -39,6 +39,14 @@ local utils = require("utils")
 ---@field visible boolean
 ---@field input? TextInput
 
+---@class SessionPickerState
+---@field visible boolean
+---@field input? TextInput
+---@field selected number
+---@field scroll_offset number
+---@field sessions string[]
+---@field regions PaletteRegion[]
+
 ---@class State
 ---@field tabs Tab[]
 ---@field active_tab integer
@@ -54,8 +62,10 @@ local utils = require("utils")
 ---@field palette PaletteState
 ---@field rename RenameState
 ---@field rename_tab RenameState
+---@field session_picker SessionPickerState
 ---@field screen_cols number
 ---@field screen_rows number
+---@field keybind_matcher? KeybindMatcher
 
 ---@class Command
 ---@field name string
@@ -153,21 +163,15 @@ local POWERLINE_SYMBOLS = {
 ---@class PriseTabBarConfig
 ---@field show_single_tab? boolean Show tab bar even with one tab (default: false)
 
----@class PriseKeybind
----@field key string The key (e.g., "k", "p", "Enter")
----@field ctrl? boolean Require ctrl modifier
----@field alt? boolean Require alt modifier
----@field shift? boolean Require shift modifier
----@field super? boolean Require super/cmd modifier
-
----@class PriseKeybinds
----@field leader? PriseKeybind Key to enter command mode (default: super+k)
----@field palette? PriseKeybind Key to open command palette (default: super+p)
+---Keybinds are a map from key_string to action name
+---Example: ["<leader>v"] = "split_horizontal"
+---@alias PriseKeybinds table<string, string|function>
 
 ---@class PriseBordersConfig
 ---@field enabled? boolean Show pane borders (default: false)
 ---@field show_single_pane? boolean Show border when only one pane exists (default: false)
----@field style? "none"|"single"|"double"|"rounded" Border style (default: "single")
+---@field mode? "box"|"separator" Border mode: "box" for full borders, "separator" for tmux-style (default: "box")
+---@field style? "none"|"single"|"double"|"rounded" Border line style (default: "single")
 ---@field focused_color? string Hex color for focused pane border (default: "#89b4fa")
 ---@field unfocused_color? string Hex color for unfocused borders (default: "#585b70")
 
@@ -176,7 +180,8 @@ local POWERLINE_SYMBOLS = {
 ---@field borders? PriseBordersConfig Pane border options
 ---@field status_bar? PriseStatusBarConfig Status bar options
 ---@field tab_bar? PriseTabBarConfig Tab bar options
----@field keybinds? PriseKeybinds Keybind configuration
+---@field leader? string Leader key sequence (default: "<D-k>")
+---@field keybinds? PriseKeybinds Keybind definitions
 ---@field macos_option_as_alt? "false"|"left"|"right"|"true" macOS Option key behavior (default: "false")
 
 ---@class PriseConfig
@@ -184,6 +189,7 @@ local POWERLINE_SYMBOLS = {
 ---@field borders PriseBordersConfig
 ---@field status_bar PriseStatusBarConfig
 ---@field tab_bar PriseTabBarConfig
+---@field leader string
 ---@field keybinds PriseKeybinds
 
 -- Default configuration
@@ -211,6 +217,7 @@ local config = {
     borders = {
         enabled = false,
         show_single_pane = false,
+        mode = "box", -- "box" for full borders, "separator" for tmux-style
         style = "single",
         focused_color = "#89b4fa", -- Blue (matches default theme.accent)
         unfocused_color = "#585b70", -- Gray (matches default theme.bg4)
@@ -221,9 +228,39 @@ local config = {
     tab_bar = {
         show_single_tab = false,
     },
+    leader = "<D-k>",
     keybinds = {
-        leader = { key = "k", super = true },
-        palette = { key = "p", super = true },
+        ["<D-p>"] = "command_palette",
+        ["<leader>v"] = "split_horizontal",
+        ["<leader>s"] = "split_vertical",
+        ["<leader><Enter>"] = "split_auto",
+        ["<leader>h"] = "focus_left",
+        ["<leader>l"] = "focus_right",
+        ["<leader>j"] = "focus_down",
+        ["<leader>k"] = "focus_up",
+        ["<leader>w"] = "close_pane",
+        ["<leader>z"] = "toggle_zoom",
+        ["<leader>t"] = "new_tab",
+        ["<leader>c"] = "close_tab",
+        ["<leader>r"] = "rename_tab",
+        ["<leader>n"] = "next_tab",
+        ["<leader>p"] = "previous_tab",
+        ["<leader>d"] = "detach_session",
+        ["<leader>q"] = "quit",
+        ["<leader>H"] = "resize_left",
+        ["<leader>L"] = "resize_right",
+        ["<leader>J"] = "resize_down",
+        ["<leader>K"] = "resize_up",
+        ["<leader>1"] = "tab_1",
+        ["<leader>2"] = "tab_2",
+        ["<leader>3"] = "tab_3",
+        ["<leader>4"] = "tab_4",
+        ["<leader>5"] = "tab_5",
+        ["<leader>6"] = "tab_6",
+        ["<leader>7"] = "tab_7",
+        ["<leader>8"] = "tab_8",
+        ["<leader>9"] = "tab_9",
+        ["<leader>0"] = "tab_10",
     },
     macos_option_as_alt = "false",
 }
@@ -266,6 +303,15 @@ local state = {
         visible = false,
         input = nil, -- TextInput handle
     },
+    -- Session switcher
+    session_picker = {
+        visible = false,
+        input = nil, -- TextInput handle
+        selected = 1,
+        scroll_offset = 0,
+        sessions = {}, -- List of session names
+        regions = {}, -- Click regions for items
+    },
     -- Tab bar hit regions: array of {start_x, end_x, tab_index}
     tab_regions = {},
     -- Tab close button regions: array of {start_x, end_x, tab_index}
@@ -281,9 +327,23 @@ local state = {
     cached_git_branch = nil,
     -- True when detaching (prevents new timers from being scheduled)
     detaching = false,
+    -- Keybind matcher (initialized by init_keybinds)
+    keybind_matcher = nil,
 }
 
 local M = {}
+
+---Forward declaration for action_handlers (defined after helper functions)
+---@type table<string, fun()>
+local action_handlers
+
+---Initialize keybinds by compiling the trie
+local function init_keybinds()
+    if state.keybind_matcher then
+        return
+    end
+    state.keybind_matcher = prise.keybind.compile(config.keybinds, config.leader)
+end
 
 ---Configure the default UI
 ---@param opts? PriseConfigOptions Configuration options to merge
@@ -291,6 +351,9 @@ function M.setup(opts)
     if opts then
         merge_config(config, opts)
     end
+    -- Mark keybinds for re-initialization on next key event
+    -- (lazy init because UI pointer may not be available during config loading)
+    state.keybind_matcher = nil
 end
 
 ---Get the macos_option_as_alt setting
@@ -302,29 +365,6 @@ end
 local RESIZE_STEP = 0.05 -- 5% step for keyboard resize
 local PALETTE_WIDTH = 60 -- Total width of command palette
 local PALETTE_INNER_WIDTH = 56 -- Inner width (PALETTE_WIDTH - 4 for padding)
-
----Check if a key event matches a keybind
----@param event_data table The event.data from a key_press event
----@param bind PriseKeybind The keybind to match against
----@return boolean
-local function matches_keybind(event_data, bind)
-    if event_data.key ~= bind.key then
-        return false
-    end
-    if (bind.ctrl or false) ~= (event_data.ctrl or false) then
-        return false
-    end
-    if (bind.alt or false) ~= (event_data.alt or false) then
-        return false
-    end
-    if (bind.shift or false) ~= (event_data.shift or false) then
-        return false
-    end
-    if (bind.super or false) ~= (event_data.super or false) then
-        return false
-    end
-    return true
-end
 
 -- --- Helpers ---
 
@@ -912,6 +952,188 @@ local function should_show_borders()
     return count_panes(root) > 1
 end
 
+---Check if a node subtree contains the focused pane
+---@param node Node
+---@return boolean
+local function contains_focused(node)
+    if not node or not state.focused_id then
+        return false
+    end
+    if is_pane(node) then
+        return node.id == state.focused_id
+    elseif is_split(node) then
+        for _, child in ipairs(node.children) do
+            if contains_focused(child) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---Compute a child's share as used by the layout engine
+---@param split Split
+---@param idx number
+---@return number
+local function layout_share(split, idx)
+    local ratio_sum = 0
+    local nil_count = 0
+
+    for _, child in ipairs(split.children) do
+        if child.ratio then
+            ratio_sum = ratio_sum + child.ratio
+        else
+            nil_count = nil_count + 1
+        end
+    end
+
+    local remaining = 1.0 - ratio_sum
+    if remaining < 0 then
+        remaining = 0
+    end
+
+    local nil_share = (nil_count > 0) and (remaining / nil_count) or 0
+    return split.children[idx].ratio or nil_share
+end
+
+---Collect leaf ranges along a target split direction, in 0.0-1.0 space
+---@param node Node
+---@param target_direction "row"|"col"
+---@param range_start number
+---@param range_end number
+---@param out? table[]
+---@param depth? number
+---@return table[]
+local function collect_leaf_ranges(node, target_direction, range_start, range_end, out, depth)
+    out = out or {}
+    depth = depth or 0
+
+    local MAX_DEPTH = 20
+    if depth > MAX_DEPTH then
+        table.insert(out, { node = node, ratio_start = range_start, ratio_end = range_end })
+        return out
+    end
+
+    if is_pane(node) then
+        table.insert(out, { node = node, ratio_start = range_start, ratio_end = range_end })
+        return out
+    end
+
+    if is_split(node) and node.direction == target_direction and node.children and #node.children > 0 then
+        ---@cast node Split
+        local span = range_end - range_start
+        local pos = range_start
+
+        for i, child in ipairs(node.children) do
+            local share = layout_share(node, i)
+            local child_start = pos
+            local child_end = (i == #node.children) and range_end or (pos + span * share)
+            collect_leaf_ranges(child, target_direction, child_start, child_end, out, depth + 1)
+            pos = child_end
+        end
+
+        return out
+    end
+
+    table.insert(out, { node = node, ratio_start = range_start, ratio_end = range_end })
+    return out
+end
+
+---Find the focused range within a set of leaf ranges
+---@param ranges table[]
+---@return number?, number?
+local function get_focused_range(ranges)
+    for _, r in ipairs(ranges) do
+        if contains_focused(r.node) then
+            return r.ratio_start, r.ratio_end
+        end
+    end
+    return nil, nil
+end
+
+---Build per-section styles for a separator adjacent to the focused pane
+---@param left_child Node
+---@param right_child Node
+---@param sep_axis "horizontal"|"vertical"
+---@return table[]? segments
+local function build_separator_segments(left_child, right_child, sep_axis)
+    local target_direction = (sep_axis == "vertical") and "col" or "row"
+
+    local left_ranges = collect_leaf_ranges(left_child, target_direction, 0.0, 1.0)
+    local right_ranges = collect_leaf_ranges(right_child, target_direction, 0.0, 1.0)
+
+    local edges = { 0.0, 1.0 }
+    for _, r in ipairs(left_ranges) do
+        table.insert(edges, r.ratio_start)
+        table.insert(edges, r.ratio_end)
+    end
+    for _, r in ipairs(right_ranges) do
+        table.insert(edges, r.ratio_start)
+        table.insert(edges, r.ratio_end)
+    end
+
+    table.sort(edges)
+
+    local unique = {}
+    local last = nil
+    for _, e in ipairs(edges) do
+        if last == nil or math.abs(e - last) > 1e-6 then
+            table.insert(unique, e)
+            last = e
+        end
+    end
+
+    if #unique <= 2 then
+        return nil
+    end
+
+    local left_focus_start, left_focus_end = get_focused_range(left_ranges)
+    local right_focus_start, right_focus_end = get_focused_range(right_ranges)
+
+    local segments = {}
+
+    local function push_segment(seg_start, seg_end, color)
+        if seg_end <= seg_start then
+            return
+        end
+
+        local last_seg = segments[#segments]
+        if
+            last_seg
+            and last_seg.style
+            and last_seg.style.fg == color
+            and math.abs(last_seg.ratio_end - seg_start) < 1e-6
+        then
+            last_seg.ratio_end = seg_end
+            return
+        end
+
+        table.insert(segments, {
+            ratio_start = seg_start,
+            ratio_end = seg_end,
+            style = { fg = color },
+        })
+    end
+
+    for i = 1, #unique - 1 do
+        local a = unique[i]
+        local b = unique[i + 1]
+
+        local focused = false
+        if left_focus_start ~= nil then
+            focused = focused or (a < left_focus_end and b > left_focus_start)
+        end
+        if right_focus_start ~= nil then
+            focused = focused or (a < right_focus_end and b > right_focus_start)
+        end
+
+        local color = focused and config.borders.focused_color or config.borders.unfocused_color
+        push_segment(a, b, color)
+    end
+
+    return segments
+end
+
 ---Serialize a node tree to a table with pty_ids instead of userdata
 ---@param node? Node
 ---@param cwd_lookup? fun(pty_id: number): string?
@@ -1216,6 +1438,10 @@ local key_prefix = prise.platform == "macos" and "󰘳 +k" or "Super+k"
 ---@type fun()
 local open_rename
 
+---Forward declaration for open_session_picker
+---@type fun()
+local open_session_picker
+
 ---Command palette commands
 ---@type Command[]
 local commands = {
@@ -1359,6 +1585,13 @@ local commands = {
         end,
     },
     {
+        name = "Switch Session",
+        shortcut = key_prefix .. " S",
+        action = function()
+            open_session_picker()
+        end,
+    },
+    {
         name = "Quit",
         shortcut = key_prefix .. " q",
         action = function()
@@ -1495,6 +1728,133 @@ local commands = {
     },
 }
 
+-- Action handlers for keybind system
+-- Maps action names (from Action enum) to handler functions
+action_handlers = {
+    split_horizontal = function()
+        local pty = get_focused_pty()
+        state.pending_split = { direction = "row" }
+        prise.spawn({ cwd = pty and pty:cwd() })
+    end,
+    split_vertical = function()
+        local pty = get_focused_pty()
+        state.pending_split = { direction = "col" }
+        prise.spawn({ cwd = pty and pty:cwd() })
+    end,
+    split_auto = function()
+        local pty = get_focused_pty()
+        state.pending_split = { direction = get_auto_split_direction() }
+        prise.spawn({ cwd = pty and pty:cwd() })
+    end,
+    focus_left = function()
+        move_focus("left")
+    end,
+    focus_right = function()
+        move_focus("right")
+    end,
+    focus_up = function()
+        move_focus("up")
+    end,
+    focus_down = function()
+        move_focus("down")
+    end,
+    close_pane = function()
+        local root = get_active_root()
+        local path = state.focused_id and find_node_path(root, state.focused_id)
+        if path then
+            local pane = path[#path]
+            pane.pty:close()
+            local was_last = remove_pane_by_id(pane.id)
+            if not was_last then
+                prise.save()
+            end
+        end
+    end,
+    toggle_zoom = function()
+        if state.zoomed_pane_id then
+            state.zoomed_pane_id = nil
+        elseif state.focused_id then
+            state.zoomed_pane_id = state.focused_id
+        end
+        prise.request_frame()
+    end,
+    new_tab = function()
+        local pty = get_focused_pty()
+        state.pending_new_tab = true
+        prise.spawn({ cwd = pty and pty:cwd() })
+    end,
+    close_tab = function()
+        close_current_tab()
+    end,
+    rename_tab = function()
+        open_rename_tab()
+    end,
+    next_tab = function()
+        if #state.tabs > 1 then
+            local next_idx = state.active_tab % #state.tabs + 1
+            set_active_tab_index(next_idx)
+        end
+    end,
+    previous_tab = function()
+        if #state.tabs > 1 then
+            local prev_idx = (state.active_tab - 2 + #state.tabs) % #state.tabs + 1
+            set_active_tab_index(prev_idx)
+        end
+    end,
+    tab_1 = function()
+        set_active_tab_index(1)
+    end,
+    tab_2 = function()
+        set_active_tab_index(2)
+    end,
+    tab_3 = function()
+        set_active_tab_index(3)
+    end,
+    tab_4 = function()
+        set_active_tab_index(4)
+    end,
+    tab_5 = function()
+        set_active_tab_index(5)
+    end,
+    tab_6 = function()
+        set_active_tab_index(6)
+    end,
+    tab_7 = function()
+        set_active_tab_index(7)
+    end,
+    tab_8 = function()
+        set_active_tab_index(8)
+    end,
+    tab_9 = function()
+        set_active_tab_index(9)
+    end,
+    tab_10 = function()
+        set_active_tab_index(10)
+    end,
+    resize_left = function()
+        resize_pane("width", -RESIZE_STEP)
+    end,
+    resize_right = function()
+        resize_pane("width", RESIZE_STEP)
+    end,
+    resize_up = function()
+        resize_pane("height", -RESIZE_STEP)
+    end,
+    resize_down = function()
+        resize_pane("height", RESIZE_STEP)
+    end,
+    detach_session = function()
+        detach_session()
+    end,
+    rename_session = function()
+        open_rename()
+    end,
+    quit = function()
+        detach_session()
+    end,
+    -- command_palette is added after open_palette is defined
+}
+
 ---@param query string
 ---@return Command[]
 local function filter_commands(query)
@@ -1519,6 +1879,11 @@ local function open_palette()
     state.palette.scroll_offset = 0
     state.palette.input:clear()
     prise.request_frame()
+end
+
+-- Add command_palette handler now that open_palette is defined
+action_handlers.command_palette = function()
+    open_palette()
 end
 
 local function close_palette()
@@ -1556,6 +1921,55 @@ local function execute_rename()
         prise.rename_session(new_name)
     end
     close_rename()
+end
+
+open_session_picker = function()
+    if not state.session_picker.input then
+        state.session_picker.input = prise.create_text_input()
+    end
+    state.session_picker.input:clear()
+    state.session_picker.sessions = prise.list_sessions() or {}
+    state.session_picker.selected = 1
+    state.session_picker.scroll_offset = 0
+    state.session_picker.visible = true
+    prise.request_frame()
+end
+
+local function close_session_picker()
+    state.session_picker.visible = false
+    prise.request_frame()
+end
+
+---Filter sessions by fuzzy matching the input text
+---@param query string
+---@return string[]
+local function filter_sessions(query)
+    if not query or query == "" then
+        return state.session_picker.sessions
+    end
+    local lower_query = query:lower()
+    local matches = {}
+    for _, session in ipairs(state.session_picker.sessions) do
+        if session:lower():find(lower_query, 1, true) then
+            table.insert(matches, session)
+        end
+    end
+    return matches
+end
+
+local function execute_session_switch()
+    local query = state.session_picker.input:text()
+    local filtered = filter_sessions(query)
+    if #filtered == 0 then
+        close_session_picker()
+        return
+    end
+    local idx = state.session_picker.selected
+    if idx >= 1 and idx <= #filtered then
+        local target = filtered[idx]
+        close_session_picker()
+        prise.switch_session(target)
+    end
 end
 
 -- --- Main Functions ---
@@ -1677,6 +2091,56 @@ function M.update(event)
             return
         end
 
+        -- Handle session picker
+        if state.session_picker.visible then
+            local k = event.data.key
+            local filtered = filter_sessions(state.session_picker.input:text())
+
+            if k == "Escape" then
+                close_session_picker()
+                return
+            elseif k == "Enter" then
+                execute_session_switch()
+                return
+            elseif k == "ArrowUp" or (k == "p" and event.data.ctrl) then
+                if state.session_picker.selected > 1 then
+                    state.session_picker.selected = state.session_picker.selected - 1
+                    -- Adjust scroll if needed
+                    if state.session_picker.selected <= state.session_picker.scroll_offset then
+                        state.session_picker.scroll_offset = state.session_picker.selected - 1
+                    end
+                end
+                prise.request_frame()
+                return
+            elseif k == "ArrowDown" or (k == "n" and event.data.ctrl) then
+                if state.session_picker.selected < #filtered then
+                    state.session_picker.selected = state.session_picker.selected + 1
+                    -- Adjust scroll if needed (visible height approx screen_rows - 15)
+                    local visible_height = math.max(1, state.screen_rows - 15)
+                    if state.session_picker.selected > state.session_picker.scroll_offset + visible_height then
+                        state.session_picker.scroll_offset = state.session_picker.selected - visible_height
+                    end
+                end
+                prise.request_frame()
+                return
+            elseif k == "Backspace" then
+                state.session_picker.input:delete_backward()
+                local new_filtered = filter_sessions(state.session_picker.input:text())
+                state.session_picker.selected = math.min(state.session_picker.selected, math.max(1, #new_filtered))
+                state.session_picker.scroll_offset = 0
+                prise.request_frame()
+                return
+            elseif #k == 1 and not event.data.ctrl and not event.data.alt and not event.data.super then
+                state.session_picker.input:insert(k)
+                local new_filtered = filter_sessions(state.session_picker.input:text())
+                state.session_picker.selected = math.min(state.session_picker.selected, math.max(1, #new_filtered))
+                state.session_picker.scroll_offset = 0
+                prise.request_frame()
+                return
+            end
+            return
+        end
+
         -- Handle rename session prompt
         if state.rename.visible then
             local k = event.data.key
@@ -1707,158 +2171,35 @@ function M.update(event)
             return
         end
 
-        -- Open command palette
-        if matches_keybind(event.data, config.keybinds.palette) then
-            open_palette()
+        -- Handle keybinds via matcher
+        init_keybinds()
+        local result = state.keybind_matcher:handle_key(event.data)
+
+        if result.action or result.func then
+            -- Cancel any pending timeout
+            if state.timer then
+                state.timer:cancel()
+                state.timer = nil
+            end
+            state.pending_command = false
+
+            -- Dispatch action
+            if result.func then
+                result.func()
+            elseif result.action then
+                local handler = action_handlers[result.action]
+                if handler then
+                    handler()
+                end
+            end
+            prise.request_frame()
             return
-        end
+        elseif result.pending then
+            -- Key sequence in progress
+            state.pending_command = true
+            prise.request_frame()
 
-        -- Handle pending command mode (after Super/Cmd+k)
-        if state.pending_command then
-            local handled = false
-            local k = event.data.key
-
-            -- Leader twice sends leader to inner shell (like tmux)
-            if matches_keybind(event.data, config.keybinds.leader) then
-                local pty = get_focused_pty()
-                if pty then
-                    pty:send_key(event.data)
-                end
-                if state.timer then
-                    state.timer:cancel()
-                    state.timer = nil
-                end
-                state.pending_command = false
-                prise.request_frame()
-                return
-            end
-
-            if k == "h" then
-                move_focus("left")
-                handled = true
-            elseif k == "l" then
-                move_focus("right")
-                handled = true
-            elseif k == "j" then
-                move_focus("down")
-                handled = true
-            elseif k == "k" then
-                move_focus("up")
-                handled = true
-            elseif k == "H" then
-                resize_pane("width", -RESIZE_STEP)
-                handled = true
-            elseif k == "L" then
-                resize_pane("width", RESIZE_STEP)
-                handled = true
-            elseif k == "J" then
-                resize_pane("height", RESIZE_STEP)
-                handled = true
-            elseif k == "K" then
-                resize_pane("height", -RESIZE_STEP)
-                handled = true
-            elseif k == "%" or k == "v" then
-                -- Split horizontal (side-by-side)
-                local pty = get_focused_pty()
-                state.pending_split = { direction = "row" }
-                prise.spawn({ cwd = pty and pty:cwd() })
-                handled = true
-            elseif k == '"' or k == "'" or k == "s" then
-                -- Split vertical (top-bottom)
-                local pty = get_focused_pty()
-                state.pending_split = { direction = "col" }
-                prise.spawn({ cwd = pty and pty:cwd() })
-                handled = true
-            elseif k == "d" then
-                -- Detach from session
-                detach_session()
-                handled = true
-            elseif k == "t" then
-                -- New tab
-                local pty = get_focused_pty()
-                state.pending_new_tab = true
-                prise.spawn({ cwd = pty and pty:cwd() })
-                handled = true
-            elseif k == "n" then
-                -- Next tab
-                if #state.tabs > 1 then
-                    local next_idx = state.active_tab % #state.tabs + 1
-                    set_active_tab_index(next_idx)
-                end
-                handled = true
-            elseif k == "p" then
-                -- Previous tab
-                if #state.tabs > 1 then
-                    local prev_idx = (state.active_tab - 2 + #state.tabs) % #state.tabs + 1
-                    set_active_tab_index(prev_idx)
-                end
-                handled = true
-            elseif k == "c" then
-                -- Close current tab
-                close_current_tab()
-                handled = true
-            elseif k == "r" then
-                -- Rename current tab
-                open_rename_tab()
-                handled = true
-            elseif k >= "1" and k <= "9" then
-                -- Switch to tab N
-                local idx = math.tointeger(tonumber(k))
-                if idx and idx <= #state.tabs then
-                    set_active_tab_index(idx)
-                end
-                handled = true
-            elseif k == "0" then
-                -- Switch to tab 10
-                if 10 <= #state.tabs then
-                    set_active_tab_index(10)
-                end
-                handled = true
-            elseif k == "w" then
-                -- Close current pane
-                local root = get_active_root()
-                local path = state.focused_id and find_node_path(root, state.focused_id)
-                if path then
-                    local pane = path[#path]
-                    pane.pty:close()
-                    local was_last = remove_pane_by_id(pane.id)
-                    if not was_last then
-                        prise.save()
-                    end
-                    handled = true
-                end
-            elseif k == "q" then
-                -- Quit
-                detach_session()
-                handled = true
-            elseif k == "z" then
-                -- Toggle zoom
-                if state.zoomed_pane_id then
-                    state.zoomed_pane_id = nil
-                elseif state.focused_id then
-                    state.zoomed_pane_id = state.focused_id
-                end
-                handled = true
-            elseif k == "Enter" or k == "\r" or k == "\n" then
-                local pty = get_focused_pty()
-                state.pending_split = { direction = get_auto_split_direction() }
-                prise.spawn({ cwd = pty and pty:cwd() })
-                handled = true
-            elseif k == "Escape" then
-                handled = true
-            end
-
-            if handled then
-                if state.timer then
-                    state.timer:cancel()
-                    state.timer = nil
-                end
-                state.pending_command = false
-                prise.request_frame()
-                return
-            end
-
-            -- Reset timeout
+            -- Cancel existing timeout and start new one
             if state.timer then
                 state.timer:cancel()
             end
@@ -1866,23 +2207,21 @@ function M.update(event)
                 if state.pending_command then
                     state.pending_command = false
                     state.timer = nil
+                    state.keybind_matcher:reset()
                     prise.request_frame()
                 end
             end)
             return
         end
 
-        -- Enter command mode (leader key)
-        if matches_keybind(event.data, config.keybinds.leader) then
-            state.pending_command = true
+        -- No match - reset pending state if we were in one
+        if state.pending_command then
+            if state.timer then
+                state.timer:cancel()
+                state.timer = nil
+            end
+            state.pending_command = false
             prise.request_frame()
-            state.timer = prise.set_timeout(1000, function()
-                if state.pending_command then
-                    state.pending_command = false
-                    state.timer = nil
-                    prise.request_frame()
-                end
-            end)
             return
         end
 
@@ -2073,6 +2412,24 @@ function M.update(event)
         local child_index = d.child_index
         local new_ratio = d.ratio
 
+        -- In separator mode, widget children include separators interleaved with panes.
+        -- Widget structure: [Pane0, Sep, Pane1, Sep, Pane2, ...]
+        -- Lua state structure: [Pane0, Pane1, Pane2, ...]
+        -- Map widget child_index to lua pane_index:
+        -- - Even widget indices (0, 2, 4, ...) are panes
+        -- - Odd widget indices (1, 3, 5, ...) are separators
+        -- For a handle at the boundary after widget child N:
+        -- - If N is even (a pane), pane_index = N / 2
+        -- - If N is odd (a separator), pane_index = (N - 1) / 2 (the pane before the separator)
+        local pane_index = child_index
+        if config.borders.mode == "separator" and should_show_borders() then
+            if child_index % 2 == 0 then
+                pane_index = child_index // 2
+            else
+                pane_index = (child_index - 1) // 2
+            end
+        end
+
         -- Find the split by id and update the child's ratio
         local function update_split_ratio(node)
             if not node then
@@ -2080,9 +2437,9 @@ function M.update(event)
             end
             if is_split(node) then
                 if node.split_id == split_id then
-                    -- Found it - update the first child's ratio
-                    if node.children[child_index + 1] then
-                        node.children[child_index + 1].ratio = new_ratio
+                    -- Found it - update the pane's ratio
+                    if node.children[pane_index + 1] then
+                        node.children[pane_index + 1].ratio = new_ratio
                     end
                     return true
                 end
@@ -2124,8 +2481,8 @@ local function render_node(node, force_unfocused)
             focus = is_focused,
         })
 
-        -- Wrap in Box if borders should be shown
-        if should_show_borders() then
+        -- Wrap in Box if borders should be shown (only in box mode)
+        if should_show_borders() and config.borders.mode == "box" then
             local border_color = is_focused and config.borders.focused_color or config.borders.unfocused_color
 
             return prise.Box({
@@ -2139,8 +2496,55 @@ local function render_node(node, force_unfocused)
         end
     elseif is_split(node) then
         local children_widgets = {}
-        for _, child in ipairs(node.children) do
-            table.insert(children_widgets, render_node(child, force_unfocused))
+
+        -- In separator mode, insert separators between children
+        if should_show_borders() and config.borders.mode == "separator" then
+            for i, child in ipairs(node.children) do
+                -- Add separator before this child (except for first)
+                if i > 1 then
+                    local prev_child = node.children[i - 1]
+                    local prev_focused = contains_focused(prev_child)
+                    local curr_focused = contains_focused(child)
+
+                    local sep_axis = node.direction == "row" and "vertical" or "horizontal"
+
+                    local segments = nil
+                    if prev_focused or curr_focused then
+                        segments = build_separator_segments(prev_child, child, sep_axis)
+                    end
+
+                    if segments then
+                        table.insert(
+                            children_widgets,
+                            prise.Separator({
+                                axis = sep_axis,
+                                style = { fg = config.borders.unfocused_color },
+                                segments = segments,
+                                border = config.borders.style,
+                            })
+                        )
+                    else
+                        -- Default behavior: highlight whole separator if adjacent to focus
+                        local sep_color = (prev_focused or curr_focused) and config.borders.focused_color
+                            or config.borders.unfocused_color
+
+                        table.insert(
+                            children_widgets,
+                            prise.Separator({
+                                axis = sep_axis,
+                                style = { fg = sep_color },
+                                border = config.borders.style,
+                            })
+                        )
+                    end
+                end
+                table.insert(children_widgets, render_node(child, force_unfocused))
+            end
+        else
+            -- Box mode or no borders: just render children directly
+            for _, child in ipairs(node.children) do
+                table.insert(children_widgets, render_node(child, force_unfocused))
+            end
         end
 
         local props = {
@@ -2242,7 +2646,10 @@ local function build_palette()
                             input = state.palette.input,
                             style = input_style,
                         }),
-                        prise.Text({ text = string.rep("─", PALETTE_WIDTH), style = { fg = THEME.bg3 } }),
+                        prise.Text({
+                            text = string.rep("─", PALETTE_WIDTH),
+                            style = { fg = THEME.bg3, bg = THEME.bg1 },
+                        }),
                         prise.List({
                             items = items,
                             selected = state.palette.selected,
@@ -2282,7 +2689,7 @@ local function build_rename()
                 child = prise.Column({
                     cross_axis_align = "stretch",
                     children = {
-                        prise.Text({ text = "Rename Session", style = { fg = THEME.fg_dim } }),
+                        prise.Text({ text = "Rename Session", style = { fg = THEME.fg_dim, bg = THEME.bg1 } }),
                         prise.TextInput({
                             input = state.rename.input,
                             style = input_style,
@@ -2319,10 +2726,97 @@ local function build_rename_tab()
                 child = prise.Column({
                     cross_axis_align = "stretch",
                     children = {
-                        prise.Text({ text = "Rename Tab", style = { fg = THEME.fg_dim } }),
+                        prise.Text({ text = "Rename Tab", style = { fg = THEME.fg_dim, bg = THEME.bg1 } }),
                         prise.TextInput({
                             input = state.rename_tab.input,
                             style = input_style,
+                        }),
+                    },
+                }),
+            }),
+        }),
+    })
+end
+
+---Build the session picker modal
+---@return table?
+local function build_session_picker()
+    if not state.session_picker.visible or not state.session_picker.input then
+        state.session_picker.regions = {}
+        return nil
+    end
+
+    local text = state.session_picker.input:text()
+    local filtered = filter_sessions(text)
+    local has_sessions = #filtered > 0
+
+    local items = {}
+    local current_session = prise.get_session_name()
+    for _, session in ipairs(filtered) do
+        local display = session
+        if session == current_session then
+            display = session .. " (current)"
+        end
+        table.insert(items, display)
+    end
+
+    if not has_sessions then
+        table.insert(items, "No sessions found")
+    end
+
+    local palette_style = { bg = THEME.bg1, fg = THEME.fg_bright }
+    local selected_style = { bg = THEME.accent, fg = THEME.fg_dark }
+    local input_style = { bg = THEME.bg1, fg = THEME.fg_bright }
+
+    -- Calculate click regions for visible items
+    local items_start_y = 5 + 1 + 1 + 1 -- palette_y + padding + input + separator
+    state.session_picker.regions = {}
+    if has_sessions then
+        local available_height = state.screen_rows - items_start_y - 1
+        local visible_count = math.min(#items - state.session_picker.scroll_offset, available_height)
+        for display_row = 1, visible_count do
+            local item_index = state.session_picker.scroll_offset + display_row
+            table.insert(state.session_picker.regions, {
+                start_y = items_start_y + (display_row - 1),
+                end_y = items_start_y + display_row,
+                index = item_index,
+            })
+        end
+    end
+
+    return prise.Positioned({
+        anchor = "top_center",
+        y = 5,
+        focus = true,
+        child = prise.Box({
+            border = "none",
+            max_width = PALETTE_WIDTH,
+            style = palette_style,
+            focus = true,
+            child = prise.Padding({
+                top = 1,
+                bottom = 1,
+                left = 2,
+                right = 2,
+                child = prise.Column({
+                    cross_axis_align = "stretch",
+                    children = {
+                        prise.Text({ text = "Switch Session", style = { fg = THEME.fg_dim, bg = THEME.bg1 } }),
+                        prise.TextInput({
+                            input = state.session_picker.input,
+                            style = input_style,
+                            focus = true,
+                        }),
+                        prise.Text({
+                            text = string.rep("─", PALETTE_WIDTH),
+                            style = { fg = THEME.bg3, bg = THEME.bg1 },
+                        }),
+                        prise.List({
+                            items = items,
+                            selected = state.session_picker.selected,
+                            scroll_offset = state.session_picker.scroll_offset,
+                            style = palette_style,
+                            selected_style = selected_style,
                         }),
                     },
                 }),
@@ -2569,11 +3063,15 @@ function M.view()
     local palette = build_palette()
     local rename = build_rename()
     local rename_tab = build_rename_tab()
+    local session_picker = build_session_picker()
     local tab_bar = build_tab_bar()
     prise.log.debug("view: palette.visible=" .. tostring(state.palette.visible))
 
     -- When zoomed, render only the zoomed pane
-    local overlay_visible = state.palette.visible or state.rename.visible or state.rename_tab.visible
+    local overlay_visible = state.palette.visible
+        or state.rename.visible
+        or state.rename_tab.visible
+        or state.session_picker.visible
     local content
     if state.zoomed_pane_id then
         local path = find_node_path(root, state.zoomed_pane_id)
@@ -2619,7 +3117,7 @@ function M.view()
         children = main_children,
     })
 
-    local overlay = palette or rename or rename_tab
+    local overlay = palette or rename or rename_tab or session_picker
     if overlay then
         return prise.Stack({
             children = {
@@ -2724,7 +3222,6 @@ end
 
 -- Export internal functions for testing
 M._test = {
-    matches_keybind = matches_keybind,
     is_pane = is_pane,
     is_split = is_split,
     collect_panes = collect_panes,

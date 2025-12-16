@@ -163,6 +163,7 @@ local ui = require("prise").tiling()
 ui.setup({
     borders = {
         enabled = true,
+        mode = "box",                   -- "box" for full borders, "separator" for tmux-style
         style = "rounded",              -- "single", "double", "rounded", or "none"
         focused_color = "#89b4fa",      -- Blue for active pane (default)
         unfocused_color = "#585b70",    -- Gray for inactive panes (default)
@@ -171,6 +172,10 @@ ui.setup({
 
 return ui
 ```
+
+Available border modes:
+- `"box"` - Full borders around each pane (default)
+- `"separator"` - Tmux-style borders between panes only
 
 Available border styles:
 - `"single"` - Single-line borders: `┌─┐│└┘` (default)
@@ -198,6 +203,28 @@ The default leader key is `Super+k` (Cmd+k on macOS). After pressing the leader:
 | `q` | Quit |
 
 Press `Super+p` to open the command palette.
+
+### Custom Keybinds
+
+You can add custom keybinds that trigger built-in actions or custom Lua functions:
+
+```lua
+local prise = require("prise")
+local ui = prise.tiling()
+
+ui.setup({
+    leader = "<C-a>",  -- Use Ctrl+a as leader (like tmux)
+    keybinds = {
+        ["<leader>g"] = function()
+            prise.log.info("Custom keybind!")
+        end,
+    },
+})
+
+return ui
+```
+
+See `prise(5)` for the full key string syntax.
 
 ## Lua LSP Setup
 
